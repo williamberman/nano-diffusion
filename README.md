@@ -1,5 +1,7 @@
 # Nano Diffusion
 
+NOTE: a lot of this code is a wip and I'm still fidding with a few apis.
+
 Nano Diffusion is a small (< 3k loc) and self contained implementation of diffusion models.
 Its primary focus is Stable Diffusion XL inference and training including support in both for controlnet and t2i adapter auxiliary networks.
 
