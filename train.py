@@ -9,6 +9,7 @@ from typing import Dict, List, Literal, Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import wandb
 import yaml
 from PIL import Image
 from torch.cuda.amp.grad_scaler import GradScaler
@@ -17,7 +18,6 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-import wandb
 from diffusion import make_sigmas, sdxl_diffusion_loop
 from models import (SDXLAdapter, SDXLCLIPOne, SDXLCLIPTwo, SDXLControlNet,
                     SDXLUNet, SDXLVae, make_clip_tokenizer_one_from_hub,
@@ -100,88 +100,24 @@ def main(training_config):
                 config=training_config,
             )
 
-    tokenizer_one = make_clip_tokenizer_one_from_hub()
-    tokenizer_two = make_clip_tokenizer_two_from_hub()
-
-    text_encoder_one = SDXLCLIPOne.load_fp16(device=device)
-    text_encoder_one.requires_grad_(False)
-    text_encoder_one.eval()
-
-    text_encoder_two = SDXLCLIPTwo.load_fp16(device=device)
-    text_encoder_two.requires_grad_(False)
-    text_encoder_two.eval()
-
-    vae = SDXLVae.load_fp16_fix(device=device)
-    vae.to(torch.float16)
-    vae.requires_grad_(False)
-    vae.eval()
-
-    sigmas = make_sigmas(device=device)
-
-    parameters = []
-
-    if training_config.controlnet is None and training_config.adapter is None:
-        if training_config.unet_resume_from is None:
-            unet = SDXLUNet.load_fp32()
-        else:
-            unet = SDXLUNet.load(training_config.unet_resume_from, device=device)
-        unet.requires_grad_(True)
-        unet.train()
-        unet = DDP(unet, device_ids=[device])
-
-        parameters.extend(unet.module.parameters())
-    else:
-        unet = SDXLUNet.load_fp16(device=device)
-        unet.requires_grad_(False)
-        unet.eval()
-
     if training_config.controlnet is not None:
-        if training_config.controlnet_resume_from is None:
-            controlnet = SDXLControlNet.from_unet(unet)
-            controlnet.to(device)
-        else:
-            controlnet = SDXLControlNet.load(training_config.controlnet_resume_from, device=device)
-        controlnet.train()
-        controlnet.requires_grad_(True)
-        controlnet = DDP(controlnet, device_ids=[device])
-
-        parameters.extend(controlnet.module.parameters())
+        x = init_train_controlnet(training_config)
+        tokenizer_one = x["tokenizer_one"]
+        tokenizer_two = x["tokenizer_two"]
+        text_encoder_one = x["text_encoder_one"]
+        text_encoder_two = x["text_encoder_two"]
+        vae = x["vae"]
+        sigmas = x["sigmas"]
+        unet = x["unet"]
+        controlnet = x["controlnet"]
+        optimizer = x["optimizer"]
+        lr_scheduler = x["lr_scheduler"]
+        dataloader = x["dataloader"]
+        parameters = x["parameters"]
     else:
-        controlnet = None
+        assert False
 
-    if training_config.adapter is not None:
-        if training_config.adapter_resume_from is None:
-            adapter = SDXLAdapter()
-            adapter.to(device)
-        else:
-            adapter = SDXLAdapter.load(training_config.adapter_resume_from, device=device)
-        adapter.train()
-        adapter.requires_grad_(True)
-        adapter = DDP(adapter, device_ids=[device])
-
-        parameters.extend(adapter.module.parameters())
-    else:
-        adapter = None
-
-    if training_config.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError("To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`.")
-
-        optimizer = bnb.optim.AdamW8bit(parameters, lr=training_config.learning_rate)
-    else:
-        optimizer = AdamW(parameters, lr=training_config.learning_rate)
-
-    # TODO - make LR configurable for more than finetuning
-    lr_scheduler = LambdaLR(optimizer, lambda _: 1)
-
-    if training_config.optimizer_resume_from is not None:
-        optimizer.load_state_dict(torch.load(training_config.optimizer_resume_from, map_location=torch.device(device)))
-
-    module, fn = training_config.dataloader.split(".")
-    dataloader_fn = getattr(importlib.import_module(module), fn)
-    dataloader = iter(dataloader_fn(training_config, tokenizer_one, tokenizer_two))
+    dataloader = iter(dataloader)
 
     scaler = GradScaler(enabled=training_config.mixed_precision == torch.float16)
 
@@ -191,17 +127,17 @@ def main(training_config):
         for _ in range(training_config.gradient_accumulation_steps):
             batch = next(dataloader)
 
-            loss = train_step(
-                text_encoder_one=text_encoder_one,
-                text_encoder_two=text_encoder_two,
-                vae=vae,
-                unet=unet,
-                mixed_precision=training_config.mixed_precision,
-                batch=batch,
-                controlnet=controlnet,
-                adapter=adapter,
-                sigmas=sigmas,
-            )
+            if training_config.controlnet is not None:
+                loss = train_step_train_controlnet(
+                    text_encoder_one=text_encoder_one,
+                    text_encoder_two=text_encoder_two,
+                    vae=vae,
+                    unet=unet,
+                    mixed_precision=training_config.mixed_precision,
+                    batch=batch,
+                    controlnet=controlnet,
+                    sigmas=sigmas,
+                )
 
             loss = loss / training_config.gradient_accumulation_steps
 
@@ -226,21 +162,23 @@ def main(training_config):
 
         if training_step != 0 and training_step % training_config.checkpointing_steps == 0:
             if dist.get_rank() == 0:
-                save_checkpoint(
-                    unet=unet,
+                save_path = make_save_checkpoint(
                     output_dir=training_config.output_dir,
                     checkpoints_total_limit=training_config.checkpoints_total_limit,
                     training_step=training_step,
-                    optimizer=optimizer,
-                    controlnet=controlnet,
-                    adapter=adapter,
                 )
+
+                if training_config.controlnet is not None:
+                    save_models_train_controlnet(save_path, optimizer, unet, controlnet)
+                else:
+                    assert False
 
             dist.barrier()
 
         if training_config.log_to_wandb and dist.get_rank() == 0 and training_step != 0 and training_step % training_config.validation_steps == 0:
             logger.info("Running validation")
 
+            # TODO - get rid of this
             module, fn = training_config.validation_image_conditioning.split(".")
             validation_image_conditioning = getattr(importlib.import_module(module), fn)
 
@@ -249,7 +187,7 @@ def main(training_config):
             else:
                 validation_timesteps = None
 
-            output_images, conditioning_images = log_validation(
+            output_images, conditioning_images = log_validation_train_controlnet(
                 tokenizer_one=tokenizer_one,
                 text_encoder_one=text_encoder_one,
                 tokenizer_two=tokenizer_two,
@@ -261,7 +199,6 @@ def main(training_config):
                 validation_prompts=training_config.validation_prompts,
                 validation_images=training_config.validation_images,
                 validation_image_conditioning=validation_image_conditioning,
-                adapter=adapter,
                 controlnet=controlnet,
                 timesteps=validation_timesteps,
             )
@@ -284,31 +221,98 @@ def main(training_config):
         save_models(unet, training_config.output_dir, optimizer=optimizer, controlnet=controlnet, adapter=adapter)
 
 
-def train_step(text_encoder_one, text_encoder_two, vae, sigmas, unet, batch, controlnet=None, adapter=None, mixed_precision=None):
-    with torch.no_grad():
-        if isinstance(unet, DDP):
-            unet_dtype = unet.module.dtype
-            unet_device = unet.module.device
-        else:
-            unet_dtype = unet.dtype
-            unet_device = unet.device
+def init_train_controlnet(training_config, make_dataloader=True):
+    tokenizer_one = make_clip_tokenizer_one_from_hub()
+    tokenizer_two = make_clip_tokenizer_two_from_hub()
 
-        micro_conditioning = batch["micro_conditioning"].to(device=unet_device)
+    text_encoder_one = SDXLCLIPOne.load_fp16(device=device)
+    text_encoder_one.requires_grad_(False)
+    text_encoder_one.eval()
+
+    text_encoder_two = SDXLCLIPTwo.load_fp16(device=device)
+    text_encoder_two.requires_grad_(False)
+    text_encoder_two.eval()
+
+    vae = SDXLVae.load_fp16_fix(device=device)
+    vae.to(torch.float16)
+    vae.requires_grad_(False)
+    vae.eval()
+
+    sigmas = make_sigmas(device=device)
+
+    unet = SDXLUNet.load_fp16(device=device)
+    unet.requires_grad_(False)
+    unet.eval()
+
+    if training_config.controlnet_resume_from is None:
+        controlnet = SDXLControlNet.from_unet(unet)
+        controlnet.to(device)
+    else:
+        controlnet = SDXLControlNet.load(training_config.controlnet_resume_from, device=device)
+    controlnet.train()
+    controlnet.requires_grad_(True)
+    controlnet = DDP(controlnet, device_ids=[device])
+
+    parameters = [x for x in controlnet.module.parameters()]
+
+    if training_config.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`.")
+
+        optimizer = bnb.optim.AdamW8bit(parameters, lr=training_config.learning_rate)
+    else:
+        optimizer = AdamW(parameters, lr=training_config.learning_rate)
+
+    if training_config.optimizer_resume_from is not None:
+        optimizer.load_state_dict(torch.load(training_config.optimizer_resume_from, map_location=torch.device(device)))
+
+    lr_scheduler = LambdaLR(optimizer, lambda _: 1)
+
+    rv = dict(
+        tokenizer_one=tokenizer_one,
+        tokenizer_two=tokenizer_two,
+        text_encoder_one=text_encoder_one,
+        text_encoder_two=text_encoder_two,
+        vae=vae,
+        sigmas=sigmas,
+        unet=unet,
+        controlnet=controlnet,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        dataloader=dataloader,
+        parameters=parameters,
+    )
+
+    if make_dataloader:
+        # TODO - get rid of this
+        module, fn = training_config.dataloader.split(".")
+        dataloader_fn = getattr(importlib.import_module(module), fn)
+        dataloader = dataloader_fn(training_config, tokenizer_one, tokenizer_two)
+        rv["dataloader"] = dataloader
+
+    return rv
+
+
+def train_step_train_controlnet(text_encoder_one, text_encoder_two, vae, sigmas, unet, batch, controlnet, training_config: TrainingConfig):
+    with torch.no_grad():
+        micro_conditioning = batch["micro_conditioning"].to(device=unet.device)
 
         image = batch["image"].to(vae.device, dtype=vae.dtype)
-        latents = vae.encode(image).to(dtype=unet_dtype)
+        latents = vae.encode(image).to(dtype=unet.dtype)
 
         text_input_ids_one = batch["text_input_ids_one"].to(text_encoder_one.device)
         text_input_ids_two = batch["text_input_ids_two"].to(text_encoder_two.device)
 
         encoder_hidden_states, pooled_encoder_hidden_states = sdxl_text_conditioning(text_encoder_one, text_encoder_two, text_input_ids_one, text_input_ids_two)
 
-        encoder_hidden_states = encoder_hidden_states.to(dtype=unet_dtype)
-        pooled_encoder_hidden_states = pooled_encoder_hidden_states.to(dtype=unet_dtype)
+        encoder_hidden_states = encoder_hidden_states.to(dtype=unet.dtype)
+        pooled_encoder_hidden_states = pooled_encoder_hidden_states.to(dtype=unet.dtype)
 
         bsz = latents.shape[0]
 
-        timesteps = torch.randint(0, sigmas.numel(), (bsz,), device=unet_device)
+        timesteps = torch.randint(0, sigmas.numel(), (bsz,), device=unet.device)
 
         sigmas_ = sigmas[timesteps].to(dtype=latents.dtype)[:, None, None, None]
 
@@ -318,35 +322,24 @@ def train_step(text_encoder_one, text_encoder_two, vae, sigmas, unet, batch, con
 
         scaled_noisy_latents = noisy_latents / ((sigmas_**2 + 1) ** 0.5)
 
-        if "conditioning_image" in batch:
-            conditioning_image = batch["conditioning_image"].to(unet_device)
-        else:
-            conditioning_image = None
+        conditioning_image = batch["conditioning_image"].to(controlnet.module.device)
 
     with torch.autocast(
         "cuda",
-        mixed_precision,
-        enabled=mixed_precision is not None,
+        training_config.mixed_precision,
+        enabled=training_config.mixed_precision is not None,
     ):
-        down_block_additional_residuals = None
-        mid_block_additional_residual = None
-        add_to_down_block_outputs = None
+        controlnet_out = controlnet(
+            x_t=scaled_noisy_latents,
+            t=timesteps,
+            encoder_hidden_states=encoder_hidden_states,
+            micro_conditioning=micro_conditioning,
+            pooled_encoder_hidden_states=pooled_encoder_hidden_states,
+            controlnet_cond=conditioning_image,
+        )
 
-        if adapter is not None:
-            add_to_down_block_outputs = adapter(conditioning_image)
-
-        if controlnet is not None:
-            controlnet_out = controlnet(
-                x_t=scaled_noisy_latents,
-                t=timesteps,
-                encoder_hidden_states=encoder_hidden_states,
-                micro_conditioning=micro_conditioning,
-                pooled_encoder_hidden_states=pooled_encoder_hidden_states,
-                controlnet_cond=conditioning_image,
-            )
-
-            down_block_additional_residuals = controlnet_out["down_block_res_samples"]
-            mid_block_additional_residual = controlnet_out["mid_block_res_sample"]
+        down_block_additional_residuals = controlnet_out["down_block_res_samples"]
+        mid_block_additional_residual = controlnet_out["mid_block_res_sample"]
 
         model_pred = unet(
             x_t=scaled_noisy_latents,
@@ -356,7 +349,6 @@ def train_step(text_encoder_one, text_encoder_two, vae, sigmas, unet, batch, con
             pooled_encoder_hidden_states=pooled_encoder_hidden_states,
             down_block_additional_residuals=down_block_additional_residuals,
             mid_block_additional_residual=mid_block_additional_residual,
-            add_to_down_block_outputs=add_to_down_block_outputs,
         )
 
         loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
@@ -365,7 +357,7 @@ def train_step(text_encoder_one, text_encoder_two, vae, sigmas, unet, batch, con
 
 
 @torch.no_grad()
-def log_validation(
+def log_validation_train_controlnet(
     tokenizer_one,
     text_encoder_one,
     tokenizer_two,
@@ -377,29 +369,11 @@ def log_validation(
     validation_prompts,
     num_validation_images,
     validation_image_conditioning,
-    adapter=None,
-    controlnet=None,
+    controlnet,
     timesteps=None,
 ):
-    if isinstance(unet, DDP):
-        unet_ = unet.module
-        unet_.eval()
-        unet_set_to_eval = True
-    else:
-        unet_ = unet
-        unet_set_to_eval = False
-
-    if adapter is not None:
-        adapter_ = adapter.module
-        adapter_.eval()
-    else:
-        adapter_ = None
-
-    if controlnet is not None:
-        controlnet_ = controlnet.module
-        controlnet_.eval()
-    else:
-        controlnet_ = None
+    controlnet_ = controlnet.module
+    controlnet_.eval()
 
     conditioning_images = None
     formatted_validation_images = None
@@ -424,7 +398,7 @@ def log_validation(
             formatted_validation_images.append(conditioning_image["conditioning_image"][None, :, :, :])
             conditioning_images.append(wandb.Image(conditioning_image["conditioning_image_as_pil"]))
 
-    generator = torch.Generator(unet_.device).manual_seed(0)
+    generator = torch.Generator(unet.device).manual_seed(0)
 
     output_images = []
 
@@ -433,13 +407,12 @@ def log_validation(
             x_0 = sdxl_diffusion_loop(
                 prompts=validation_prompt,
                 images=formatted_validation_image,
-                unet=unet_,
+                unet=unet,
                 tokenizer_one=tokenizer_one,
                 text_encoder_one=text_encoder_one,
                 tokenizer_two=tokenizer_two,
                 text_encoder_two=text_encoder_two,
                 controlnet=controlnet_,
-                adapter=adapter_,
                 sigmas=sigmas,
                 timesteps=timesteps,
                 generator=generator,
@@ -450,19 +423,12 @@ def log_validation(
 
             output_images.append(wandb.Image(x_0, caption=validation_prompt))
 
-    if unet_set_to_eval:
-        unet_.train()
-
-    if adapter_ is not None:
-        adapter_.train()
-
-    if controlnet_ is not None:
-        controlnet_.train()
+    controlnet_.train()
 
     return output_images, conditioning_images
 
 
-def save_checkpoint(unet, output_dir, checkpoints_total_limit, training_step, optimizer, controlnet=None, adapter=None):
+def make_save_checkpoint(output_dir, checkpoints_total_limit, training_step):
     # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
     if checkpoints_total_limit is not None:
         checkpoints = os.listdir(output_dir)
@@ -485,10 +451,10 @@ def save_checkpoint(unet, output_dir, checkpoints_total_limit, training_step, op
 
     os.makedirs(save_path, exist_ok=True)
 
-    save_models(unet, save_path, optimizer=optimizer, controlnet=controlnet, adapter=adapter)
+    return save_path
 
 
-def save_models(unet, save_path: str, optimizer, controlnet=None, adapter=None):
+def save_models_train_controlnet(save_path: str, optimizer, unet, controlnet):
     try:
         torch.save(optimizer.state_dict(), os.path.join(save_path, "optimizer.bin"))
     except RuntimeError as err:
@@ -496,23 +462,13 @@ def save_models(unet, save_path: str, optimizer, controlnet=None, adapter=None):
         logger.warning(f"failed to save optimizer {err}")
 
     if has_safetensors:
-        if isinstance(unet, DDP):
-            safetensors.torch.save_file(unet.module.state_dict(), os.path.join(save_path, "unet.safetensors"))
+        safetensors.torch.save_file(unet.state_dict(), os.path.join(save_path, "unet.safetensors"))
 
-        if controlnet is not None:
-            safetensors.torch.save_file(controlnet.module.state_dict(), os.path.join(save_path, "controlnet.safetensors"))
-
-        if adapter is not None:
-            safetensors.torch.save_file(adapter.module.state_dict(), os.path.join(save_path, "adapter.safetensors"))
+        safetensors.torch.save_file(controlnet.module.state_dict(), os.path.join(save_path, "controlnet.safetensors"))
     else:
-        if isinstance(unet, DDP):
-            torch.save(unet.module.state_dict(), os.path.join(save_path, "unet.bin"))
+        torch.save(unet.state_dict(), os.path.join(save_path, "unet.bin"))
 
-        if controlnet is not None:
-            torch.save(controlnet.module.state_dict(), os.path.join(save_path, "controlnet.bin"))
-
-        if adapter is not None:
-            torch.save(adapter.module.state_dict(), os.path.join(save_path, "adapter.bin"))
+        torch.save(controlnet.module.state_dict(), os.path.join(save_path, "controlnet.bin"))
 
     logger.info(f"Saved to {save_path}")
 

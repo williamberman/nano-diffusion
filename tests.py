@@ -1,17 +1,15 @@
 import dataclasses
 import os
 import tempfile
+from collections import namedtuple
 
 import numpy as np
 import scipy
 import torch
-import torch.distributed as dist
 from diffusers import (AutoencoderKL, StableDiffusionXLPipeline,
                        UNet2DConditionModel)
 from huggingface_hub import hf_hub_download
 from PIL import Image
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim import AdamW
 
 import train
 from data import get_controlnet_inpainting_conditioning_image
@@ -305,54 +303,32 @@ class InferenceTests:
 class TrainControlnetInpaintingTests:
     def __init__(self, device):
         print(f"loading train controlnet inpainting tests {device}")
+        x = train.init_train_controlnet(
+            namedtuple_helper(
+                controlnet_resume_from=None,
+                use_8bit_adam=True,
+                optimizer_resume_from=None,
+                learning_rate=0.00001,
+            ),
+            make_dataloader=False,
+        )
 
-        tokenizer_one = make_clip_tokenizer_one_from_hub()
-        tokenizer_two = make_clip_tokenizer_two_from_hub()
-
-        text_encoder_one = SDXLCLIPOne.load_fp16(device=device)
-        text_encoder_one.requires_grad_(False)
-        text_encoder_one.eval()
-
-        text_encoder_two = SDXLCLIPTwo.load_fp16(device=device)
-        text_encoder_two.requires_grad_(False)
-        text_encoder_two.eval()
-
-        vae = SDXLVae.load_fp16_fix(device=device)
-        vae.to(torch.float16)
-        vae.requires_grad_(False)
-        vae.eval()
-
-        sigmas = make_sigmas(device=device)
-
-        unet = SDXLUNet.load_fp16()
-        unet.to(device)
-        unet.requires_grad_(False)
-        unet.eval()
-
-        controlnet = SDXLControlNet.from_unet(unet)
-        controlnet.to(device)
-        controlnet.train()
-        controlnet.requires_grad_(True)
-        controlnet = DDP(controlnet, device_ids=[device])
-
-        optimizer = AdamW(controlnet.parameters())
-
-        self.tokenizer_one = tokenizer_one
-        self.tokenizer_two = tokenizer_two
-        self.text_encoder_one = text_encoder_one
-        self.text_encoder_two = text_encoder_two
-        self.vae = vae
-        self.sigmas = sigmas
-        self.unet = unet
-        self.controlnet = controlnet
-        self.optimizer = optimizer
+        self.tokenizer_one = x["tokenizer_one"]
+        self.tokenizer_two = x["tokenizer_two"]
+        self.text_encoder_one = x["text_encoder_one"]
+        self.text_encoder_two = x["text_encoder_two"]
+        self.vae = x["vae"]
+        self.sigmas = x["sigmas"]
+        self.unet = x["unet"]
+        self.controlnet = x["controlnet"]
+        self.optimizer = x["optimizer"]
 
     def test_log_validation_controlnet_inpainting(self):
         print("test_log_validation_controlnet_inpainting")
 
         timesteps = torch.tensor([0], dtype=torch.long, device=self.sigmas.device)
 
-        output_images, conditioning_images = train.log_validation(
+        output_images, conditioning_images = train.log_validation_train_controlnet(
             self.tokenizer_one,
             self.text_encoder_one,
             self.tokenizer_two,
@@ -375,67 +351,51 @@ class TrainControlnetInpaintingTests:
         assert conditioning_images is not None
         assert len(conditioning_images) == 2
 
-    def test_save_checkpoint(self):
-        with tempfile.TemporaryDirectory(dir=os.environ.get("TMP_DIR", None)) as tmpdir:
-            train.save_checkpoint(
-                unet=self.unet,
-                output_dir=tmpdir,
-                checkpoints_total_limit=None,
-                training_step=0,
-                optimizer=self.optimizer,
-                controlnet=self.controlnet,
-            )
 
-            assert set(os.listdir(tmpdir)) == {"checkpoint-0"}
-            assert set(os.listdir(os.path.join(tmpdir, "checkpoint-0"))) == {"optimizer.bin", "controlnet.safetensors"}
+def test_save_checkpoint():
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMP_DIR", None)) as tmpdir:
+        train.make_save_checkpoint(
+            output_dir=tmpdir,
+            checkpoints_total_limit=None,
+            training_step=0,
+        )
 
-    def test_save_checkpoint_checkpoints_total_limit(self):
-        with tempfile.TemporaryDirectory(dir=os.environ.get("TMP_DIR", None)) as tmpdir:
-            os.mkdir(os.path.join(tmpdir, "checkpoint-0"))
-            os.mkdir(os.path.join(tmpdir, "checkpoint-1"))
+        assert set(os.listdir(tmpdir)) == {"checkpoint-0"}
 
-            train.save_checkpoint(
-                unet=self.unet,
-                output_dir=tmpdir,
-                checkpoints_total_limit=3,
-                training_step=2,
-                optimizer=self.optimizer,
-                controlnet=self.controlnet,
-            )
 
-            # removes none
-            assert set(os.listdir(tmpdir)) == {"checkpoint-0", "checkpoint-1", "checkpoint-2"}
+def test_save_checkpoint_checkpoints_total_limit():
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMP_DIR", None)) as tmpdir:
+        os.mkdir(os.path.join(tmpdir, "checkpoint-0"))
+        os.mkdir(os.path.join(tmpdir, "checkpoint-1"))
 
-            train.save_checkpoint(
-                unet=self.unet,
-                output_dir=tmpdir,
-                checkpoints_total_limit=3,
-                training_step=3,
-                optimizer=self.optimizer,
-                controlnet=self.controlnet,
-            )
+        train.make_save_checkpoint(
+            output_dir=tmpdir,
+            checkpoints_total_limit=3,
+            training_step=2,
+        )
 
-            # removes one
-            assert set(os.listdir(tmpdir)) == {"checkpoint-1", "checkpoint-2", "checkpoint-3"}
+        # removes none
+        assert set(os.listdir(tmpdir)) == {"checkpoint-0", "checkpoint-1", "checkpoint-2"}
 
-            os.mkdir(os.path.join(tmpdir, "checkpoint-4"))
+        train.make_save_checkpoint(
+            output_dir=tmpdir,
+            checkpoints_total_limit=3,
+            training_step=3,
+        )
 
-            train.save_checkpoint(
-                unet=self.unet,
-                output_dir=tmpdir,
-                checkpoints_total_limit=3,
-                training_step=5,
-                optimizer=self.optimizer,
-                controlnet=self.controlnet,
-            )
+        # removes one
+        assert set(os.listdir(tmpdir)) == {"checkpoint-1", "checkpoint-2", "checkpoint-3"}
 
-            # removes two
-            assert set(os.listdir(tmpdir)) == {"checkpoint-3", "checkpoint-4", "checkpoint-5"}
+        os.mkdir(os.path.join(tmpdir, "checkpoint-4"))
 
-    def test(self):
-        self.test_log_validation_controlnet_inpainting()
-        self.test_save_checkpoint()
-        self.test_save_checkpoint_checkpoints_total_limit()
+        train.make_save_checkpoint(
+            output_dir=tmpdir,
+            checkpoints_total_limit=3,
+            training_step=5,
+        )
+
+        # removes two
+        assert set(os.listdir(tmpdir)) == {"checkpoint-3", "checkpoint-4", "checkpoint-5"}
 
 
 def test_controlnet_inpainting_main():
@@ -489,9 +449,13 @@ def test_controlnet_inpainting_main():
         assert set(os.listdir(tmpdir)) == {"controlnet.safetensors", "optimizer.bin", "checkpoint-1", "checkpoint-2"}
 
 
+def namedtuple_helper(**kwargs):
+    return namedtuple("", kwargs.keys())(**kwargs)
+
+
 if __name__ == "__main__":
-    torch.cuda.set_device(train.device)
-    dist.init_process_group("nccl")
+    # torch.cuda.set_device(train.device)
+    # dist.init_process_group("nccl")
 
     set_attention_implementation("torch_2.0_scaled_dot_product")
     with torch.backends.cuda.sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False):
@@ -505,6 +469,12 @@ if __name__ == "__main__":
             tests.test_controlnet()
             tests.test_adapter()
 
-    TrainControlnetInpaintingTests(0).test()
-    test_controlnet_inpainting_main()
-    print("All tests passed!")
+    # test_save_checkpoint()
+    # test_save_checkpoint_checkpoints_total_limit()
+
+    # tests = TrainControlnetInpaintingTests(0).test()
+    # tests.test_log_validation_controlnet_inpainting()
+
+    # test_controlnet_inpainting_main()
+
+    # print("All tests passed!")
