@@ -15,6 +15,8 @@ TODO - is PIL a dependency or is it baked into python?
 
 ## Inference
 
+NOTE: these are a wip and likely going to change -- i.e. I'm probably going to only allow passing text embeddings to `sdxl_diffusion_loop`
+
 ### Dependencies
 
 Install pytorch TODO pytorch installation instructions - note torch 2.0
