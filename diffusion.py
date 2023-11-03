@@ -272,12 +272,6 @@ def sdxl_eps_theta(
         down_block_additional_residuals = None
         mid_block_additional_residual = None
 
-    import os
-
-    kwargs = {}
-    if "PASS_THROUGH_CONDITIONING" in os.environ:
-        kwargs["controlnet_pass_through_conditioning"] = controlnet_cond
-
     eps_hat = unet(
         x_t=scaled_x_t,
         t=t,
@@ -287,7 +281,6 @@ def sdxl_eps_theta(
         down_block_additional_residuals=down_block_additional_residuals,
         mid_block_additional_residual=mid_block_additional_residual,
         add_to_down_block_outputs=add_to_down_block_outputs,
-        **kwargs,
     )
 
     if guidance_scale > 1.0:
