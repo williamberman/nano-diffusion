@@ -64,7 +64,7 @@ class TrainingConfig:
     mixed_precision: Optional[torch.dtype] = None
     max_train_steps: int = 30_000
     use_8bit_adam: bool = False
-    ema_rate: Optional[float] = None
+    ema_decay: Optional[float] = None
 
     # data
     shuffle_buffer_size: int = 1000
