@@ -18,6 +18,24 @@ except ImportError:
     has_safetensors = False
 
 
+def load_file(load_from, device):
+    if load_from.endswith(".safetensors"):
+        if not has_safetensors:
+            raise ImportError("safetensors is not installed")
+        state_dict = safetensors.torch.load_file(load_from, device=device)
+    else:
+        state_dict = torch.load(load_from, map_location=device)
+
+    if load_from.endswith(".safetensors"):
+        if not has_safetensors:
+            raise ImportError("safetensors is not installed")
+        state_dict = safetensors.torch.load_file(load_from, device="cpu")
+    else:
+        state_dict = torch.load(load_from, map_location="cpu")
+
+    return state_dict
+
+
 class ModelUtils:
     @property
     def dtype(self):
@@ -30,24 +48,14 @@ class ModelUtils:
     @classmethod
     def load(cls, load_from: str, device="cpu", strict=True):
         if version.parse(torch.__version__) >= version.parse("2.1"):
-            if load_from.endswith(".safetensors"):
-                if not has_safetensors:
-                    raise ImportError("safetensors is not installed")
-                state_dict = safetensors.torch.load_file(load_from, device=device)
-            else:
-                state_dict = torch.load(load_from, map_location=device)
+            state_dict = load_file(load_from, device=device)
 
             with torch.device("meta"):
                 model = cls()
 
             model.load_state_dict(state_dict, assign=True, strict=strict)
         else:
-            if load_from.endswith(".safetensors"):
-                if not has_safetensors:
-                    raise ImportError("safetensors is not installed")
-                state_dict = safetensors.torch.load_file(load_from, device="cpu")
-            else:
-                state_dict = torch.load(load_from, map_location="cpu")
+            state_dict = load_file(load_from, device="cpu")
 
             with torch.device(device):
                 model = cls()
@@ -1892,3 +1900,268 @@ class SDXLControlNetPreEncodedControlnetCond(nn.Module, ModelUtils):
         controlnet.mid_block.load_state_dict(unet.mid_block.state_dict())
 
         return controlnet
+
+
+class SDXLUNetInpainting(nn.Module, ModelUtils):
+    def __init__(self):
+        super().__init__()
+
+        # fmt: off
+
+        encoder_hidden_states_dim = 2048
+
+        # timesteps embedding:
+
+        time_sinusoidal_embedding_dim = 320
+        time_embedding_dim = 1280
+
+        self.get_sinusoidal_timestep_embedding = lambda timesteps: get_sinusoidal_embedding(timesteps, time_sinusoidal_embedding_dim)
+
+        self.time_embedding = nn.ModuleDict(dict(
+            linear_1=nn.Linear(time_sinusoidal_embedding_dim, time_embedding_dim),
+            act=nn.SiLU(),
+            linear_2=nn.Linear(time_embedding_dim, time_embedding_dim),
+        ))
+
+        # image size and crop coordinates conditioning embedding (i.e. micro conditioning):
+
+        num_micro_conditioning_values = 6
+        micro_conditioning_embedding_dim = 256
+        additional_embedding_encoder_dim = 1280
+        self.get_sinusoidal_micro_conditioning_embedding = lambda micro_conditioning: get_sinusoidal_embedding(micro_conditioning, micro_conditioning_embedding_dim)
+
+        self.add_embedding = nn.ModuleDict(dict(
+            linear_1=nn.Linear(additional_embedding_encoder_dim + num_micro_conditioning_values * micro_conditioning_embedding_dim, time_embedding_dim),
+            act=nn.SiLU(),
+            linear_2=nn.Linear(time_embedding_dim, time_embedding_dim),
+        ))
+
+        # actual unet blocks:
+
+        self.conv_in = nn.Conv2d(9, 320, kernel_size=3, padding=1)
+
+        self.down_blocks = nn.ModuleList([
+            # 320 -> 320
+            nn.ModuleDict(dict(
+                resnets=nn.ModuleList([
+                    ResnetBlock2D(320, 320, time_embedding_dim),
+                    ResnetBlock2D(320, 320, time_embedding_dim),
+                ]),
+                downsamplers=nn.ModuleList([nn.ModuleDict(dict(conv=nn.Conv2d(320, 320, kernel_size=3, stride=2, padding=1)))]),
+            )),
+            # 320 -> 640
+            nn.ModuleDict(dict(
+                resnets=nn.ModuleList([
+                    ResnetBlock2D(320, 640, time_embedding_dim),
+                    ResnetBlock2D(640, 640, time_embedding_dim),
+                ]),
+                attentions=nn.ModuleList([
+                    TransformerDecoder2D(640, encoder_hidden_states_dim, num_transformer_blocks=2),
+                    TransformerDecoder2D(640, encoder_hidden_states_dim, num_transformer_blocks=2),
+                ]),
+                downsamplers=nn.ModuleList([nn.ModuleDict(dict(conv=nn.Conv2d(640, 640, kernel_size=3, stride=2, padding=1)))]),
+            )),
+            # 640 -> 1280
+            nn.ModuleDict(dict(
+                resnets=nn.ModuleList([
+                    ResnetBlock2D(640, 1280, time_embedding_dim),
+                    ResnetBlock2D(1280, 1280, time_embedding_dim),
+                ]),
+                attentions=nn.ModuleList([
+                    TransformerDecoder2D(1280, encoder_hidden_states_dim, num_transformer_blocks=10),
+                    TransformerDecoder2D(1280, encoder_hidden_states_dim, num_transformer_blocks=10),
+                ]),
+            )),
+        ])
+
+        self.mid_block = nn.ModuleDict(dict(
+            resnets=nn.ModuleList([
+                ResnetBlock2D(1280, 1280, time_embedding_dim),
+                ResnetBlock2D(1280, 1280, time_embedding_dim),
+            ]),
+            attentions=nn.ModuleList([TransformerDecoder2D(1280, encoder_hidden_states_dim, num_transformer_blocks=10)]),
+        ))
+
+        self.up_blocks = nn.ModuleList([
+            # 1280 -> 1280
+            nn.ModuleDict(dict(
+                resnets=nn.ModuleList([
+                    ResnetBlock2D(1280 + 1280, 1280, time_embedding_dim),
+                    ResnetBlock2D(1280 + 1280, 1280, time_embedding_dim),
+                    ResnetBlock2D(1280 + 640, 1280, time_embedding_dim),
+                ]),
+                attentions=nn.ModuleList([
+                    TransformerDecoder2D(1280, encoder_hidden_states_dim, num_transformer_blocks=10),
+                    TransformerDecoder2D(1280, encoder_hidden_states_dim, num_transformer_blocks=10),
+                    TransformerDecoder2D(1280, encoder_hidden_states_dim, num_transformer_blocks=10),
+                ]),
+                upsamplers=nn.ModuleList([nn.ModuleDict(dict(conv=nn.Conv2d(1280, 1280, kernel_size=3, padding=1)))]),
+            )),
+            # 1280 -> 640
+            nn.ModuleDict(dict(
+                resnets=nn.ModuleList([
+                    ResnetBlock2D(1280 + 640, 640, time_embedding_dim),
+                    ResnetBlock2D(640 + 640, 640, time_embedding_dim),
+                    ResnetBlock2D(640 + 320, 640, time_embedding_dim),
+                ]),
+                attentions=nn.ModuleList([
+                    TransformerDecoder2D(640, encoder_hidden_states_dim, num_transformer_blocks=2),
+                    TransformerDecoder2D(640, encoder_hidden_states_dim, num_transformer_blocks=2),
+                    TransformerDecoder2D(640, encoder_hidden_states_dim, num_transformer_blocks=2),
+                ]),
+                upsamplers=nn.ModuleList([nn.ModuleDict(dict(conv=nn.Conv2d(640, 640, kernel_size=3, padding=1)))]),
+            )),
+            # 640 -> 320
+            nn.ModuleDict(dict(
+                resnets=nn.ModuleList([
+                    ResnetBlock2D(640 + 320, 320, time_embedding_dim),
+                    ResnetBlock2D(320 + 320, 320, time_embedding_dim),
+                    ResnetBlock2D(320 + 320, 320, time_embedding_dim),
+                ]),
+            ))
+        ])
+
+        self.conv_norm_out = nn.GroupNorm(32, 320)
+        self.conv_act = nn.SiLU()
+        self.conv_out = nn.Conv2d(320, 4, kernel_size=3, padding=1)
+
+        # fmt: on
+
+    def forward(
+        self,
+        x_t,
+        t,
+        encoder_hidden_states,
+        micro_conditioning,
+        pooled_encoder_hidden_states,
+        down_block_additional_residuals: Optional[List[torch.Tensor]] = None,
+        mid_block_additional_residual: Optional[torch.Tensor] = None,
+        add_to_down_block_outputs: Optional[List[torch.Tensor]] = None,
+    ):
+        if down_block_additional_residuals is not None:
+            down_block_additional_residuals = list(down_block_additional_residuals)
+
+        if add_to_down_block_outputs is not None:
+            add_to_down_block_outputs = list(add_to_down_block_outputs)
+
+        hidden_state = x_t
+
+        t = self.get_sinusoidal_timestep_embedding(t)
+        t = t.to(dtype=hidden_state.dtype)
+        t = self.time_embedding["linear_1"](t)
+        t = self.time_embedding["act"](t)
+        t = self.time_embedding["linear_2"](t)
+
+        additional_conditioning = self.get_sinusoidal_micro_conditioning_embedding(micro_conditioning)
+        additional_conditioning = additional_conditioning.to(dtype=hidden_state.dtype)
+        additional_conditioning = additional_conditioning.flatten(1)
+        additional_conditioning = torch.concat([pooled_encoder_hidden_states, additional_conditioning], dim=-1)
+        additional_conditioning = self.add_embedding["linear_1"](additional_conditioning)
+        additional_conditioning = self.add_embedding["act"](additional_conditioning)
+        additional_conditioning = self.add_embedding["linear_2"](additional_conditioning)
+
+        t = t + additional_conditioning
+
+        hidden_state = self.conv_in(hidden_state)
+
+        residuals = [hidden_state]
+
+        for down_block_idx, down_block in enumerate(self.down_blocks):
+            for resnet_idx, resnet in enumerate(down_block["resnets"]):
+                hidden_state = resnet(hidden_state, t)
+
+                if "attentions" in down_block:
+                    hidden_state = down_block["attentions"][resnet_idx](hidden_state, encoder_hidden_states)
+
+                residuals.append(hidden_state)
+
+            if down_block_idx != 0 and add_to_down_block_outputs is not None:
+                hidden_state = hidden_state + add_to_down_block_outputs.pop(0)
+
+            if "downsamplers" in down_block:
+                hidden_state = down_block["downsamplers"][0]["conv"](hidden_state)
+
+                residuals.append(hidden_state)
+
+            if down_block_idx == 0 and add_to_down_block_outputs is not None:
+                hidden_state = hidden_state + add_to_down_block_outputs.pop(0)
+
+        hidden_state = self.mid_block["resnets"][0](hidden_state, t)
+        hidden_state = self.mid_block["attentions"][0](hidden_state, encoder_hidden_states)
+        hidden_state = self.mid_block["resnets"][1](hidden_state, t)
+
+        if mid_block_additional_residual is not None:
+            hidden_state = hidden_state + mid_block_additional_residual
+
+        for up_block in self.up_blocks:
+            for resnet_idx, resnet in enumerate(up_block["resnets"]):
+                residual = residuals.pop()
+
+                if down_block_additional_residuals is not None:
+                    residual = residual + down_block_additional_residuals.pop()
+
+                hidden_state = torch.concat([hidden_state, residual], dim=1)
+
+                hidden_state = resnet(hidden_state, t)
+
+                if "attentions" in up_block:
+                    hidden_state = up_block["attentions"][resnet_idx](hidden_state, encoder_hidden_states)
+
+            if "upsamplers" in up_block:
+                hidden_state = F.interpolate(hidden_state, scale_factor=2.0, mode="nearest")
+                hidden_state = up_block["upsamplers"][0]["conv"](hidden_state)
+
+        hidden_state = self.conv_norm_out(hidden_state)
+        hidden_state = self.conv_act(hidden_state)
+        hidden_state = self.conv_out(hidden_state)
+
+        return hidden_state
+
+    @classmethod
+    def load_fp32(cls, device="cpu"):
+        from huggingface_hub import hf_hub_download
+
+        # TODO - shouldn't be necessary
+        if not has_safetensors:
+            raise ValueError("loading sdxl unet from huggingface hub checkpoint requires safetensors")
+
+        load_from = hf_hub_download("stabilityai/stable-diffusion-xl-base-1.0", "unet/diffusion_pytorch_model.safetensors")
+
+        if version.parse(torch.__version__) >= version.parse("2.1"):
+            state_dict = load_file(load_from, device=device)
+
+            additional_weight = torch.zeros((320, 5, 3, 3), dtype=state_dict["conv_in.weight"].dtype, device=state_dict["conv_in.weight"].device)
+            state_dict["conv_in.weight"] = torch.concat([state_dict["conv_in.weight"], additional_weight], dim=1)
+
+            with torch.device("meta"):
+                model = cls()
+
+            model.load_state_dict(state_dict, assign=True)
+        else:
+            state_dict = load_file(load_from, device="cpu")
+
+            additional_weight = torch.zeros((320, 5, 3, 3), dtype=state_dict["conv_in.weight"].dtype, device=state_dict["conv_in.weight"].device)
+            state_dict["conv_in.weight"] = torch.concat([state_dict["conv_in.weight"], additional_weight], dim=1)
+
+            with torch.device(device):
+                model = cls()
+
+            model.load_state_dict(state_dict)
+
+            # HACK: this assumes all are the same dtype
+            model.to(next(iter(state_dict.values())).dtype)
+
+        # TODO - update conv_in
+        # state_dict["conv_in.weight"] = torch.concat(state_dict["conv_in.weight"], torch.zeros())
+
+        return model
+
+    @classmethod
+    def load_fp16(cls, device="cpu"):
+        from huggingface_hub import hf_hub_download
+
+        # TODO - shouldn't be necessary
+        if not has_safetensors:
+            raise ValueError("loading sdxl unet from huggingface hub checkpoint requires safetensors")
+
+        return cls.load(hf_hub_download("stabilityai/stable-diffusion-xl-base-1.0", "unet/diffusion_pytorch_model.fp16.safetensors"), device=device)

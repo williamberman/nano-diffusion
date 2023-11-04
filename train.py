@@ -11,6 +11,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
 from PIL import Image
+from tokenizers import Tokenizer
 from torch.cuda.amp.grad_scaler import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
@@ -19,8 +20,10 @@ from torch.optim.lr_scheduler import LambdaLR
 
 import wandb
 from diffusion import make_sigmas, sdxl_diffusion_loop
-from models import (SDXLAdapter, SDXLCLIPOne, SDXLCLIPTwo, SDXLControlNet,
-                    SDXLUNet, SDXLVae, make_clip_tokenizer_one_from_hub,
+from ema_model import EMAModel
+from models import (SDXLCLIPOne, SDXLCLIPTwo, SDXLControlNet, SDXLUNet,
+                    SDXLUNetInpainting, SDXLVae,
+                    make_clip_tokenizer_one_from_hub,
                     make_clip_tokenizer_two_from_hub, sdxl_text_conditioning)
 
 try:
@@ -39,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 device = int(os.environ["LOCAL_RANK"])
 
-# TODO - test this and double check the temporarily disabling gradient syncronization during forward pass of
+# TODO - double check the temporarily disabling gradient syncronization during forward pass of
 # gradient accumulation
 
 
@@ -47,11 +50,13 @@ device = int(os.environ["LOCAL_RANK"])
 class TrainingConfig:
     output_dir: str
     train_shards: str
-    dataloader: str
+    dataloader: Optional[str] = None
 
+    # TODO - adapter and controlnet should just be rolled into train_type
     # additional networks
     adapter: Optional[Literal["openpose"]] = None
     controlnet: Optional[Literal["canny", "inpainting"]] = None
+    train_type: Optional[Literal["ema_unet_inpainting"]] = None
 
     # training
     learning_rate: float = 0.00001
@@ -70,7 +75,7 @@ class TrainingConfig:
     # validation
     validation_steps: int = 500
     num_validation_images: int = 2
-    num_validation_timesteps: Optional[int] = None
+    num_validation_timesteps: int = 50
     validation_prompts: Optional[List[str]] = None
     validation_images: Optional[List[str]] = None
 
@@ -78,6 +83,7 @@ class TrainingConfig:
     checkpointing_steps: int = 1000
     checkpoints_total_limit: int = 5
     unet_resume_from: Optional[str] = None
+    ema_unet_resume_from: Optional[str] = None
     controlnet_resume_from: Optional[str] = None
     adapter_resume_from: Optional[str] = None
     optimizer_resume_from: Optional[str] = None
@@ -89,7 +95,7 @@ class TrainingConfig:
     log_to_wandb: bool = True
 
 
-def main(training_config):
+def main(training_config: TrainingConfig):
     if dist.get_rank() == 0:
         os.makedirs(training_config.output_dir, exist_ok=True)
 
@@ -110,6 +116,20 @@ def main(training_config):
         sigmas = x["sigmas"]
         unet = x["unet"]
         controlnet = x["controlnet"]
+        optimizer = x["optimizer"]
+        lr_scheduler = x["lr_scheduler"]
+        dataloader = x["dataloader"]
+        parameters = x["parameters"]
+    elif training_config.train_type == "ema_unet_inpainting":
+        x = init_train_ema_unet_inpainting(training_config)
+        tokenizer_one = x["tokenizer_one"]
+        tokenizer_two = x["tokenizer_two"]
+        text_encoder_one = x["text_encoder_one"]
+        text_encoder_two = x["text_encoder_two"]
+        vae = x["vae"]
+        sigmas = x["sigmas"]
+        unet = x["unet"]
+        ema_unet = x["ema_unet"]
         optimizer = x["optimizer"]
         lr_scheduler = x["lr_scheduler"]
         dataloader = x["dataloader"]
@@ -138,6 +158,18 @@ def main(training_config):
                     sigmas=sigmas,
                     training_config=training_config,
                 )
+            elif training_config.train_type == "ema_unet_inpainting":
+                loss = train_step_train_ema_unet_inpainting(
+                    text_encoder_one=text_encoder_one,
+                    text_encoder_two=text_encoder_two,
+                    vae=vae,
+                    unet=unet,
+                    batch=batch,
+                    sigmas=sigmas,
+                    training_config=training_config,
+                )
+            else:
+                assert False
 
             loss = loss / training_config.gradient_accumulation_steps
 
@@ -160,6 +192,9 @@ def main(training_config):
 
         scaler.update()
 
+        if training_config.train_type == "ema_unet_inpainting":
+            ema_unet.step(unet.parameters())
+
         if training_step != 0 and training_step % training_config.checkpointing_steps == 0:
             if dist.get_rank() == 0:
                 save_path = make_save_checkpoint(
@@ -170,6 +205,8 @@ def main(training_config):
 
                 if training_config.controlnet is not None:
                     save_models_train_controlnet(save_path, optimizer=optimizer, controlnet=controlnet)
+                elif training_config.train_type == "ema_unet_inpainting":
+                    save_models_train_ema_unet_inpainting(save_path, optimizer=optimizer, unet=unet, ema_unet=ema_unet)
                 else:
                     assert False
 
@@ -178,35 +215,57 @@ def main(training_config):
         if training_config.log_to_wandb and dist.get_rank() == 0 and training_step != 0 and training_step % training_config.validation_steps == 0:
             logger.info("Running validation")
 
-            # TODO - get rid of this
-            module, fn = training_config.validation_image_conditioning.split(".")
-            validation_image_conditioning = getattr(importlib.import_module(module), fn)
+            if training_config.controlnet is not None:
+                # TODO - get rid of this
+                module, fn = training_config.validation_image_conditioning.split(".")
+                validation_image_conditioning = getattr(importlib.import_module(module), fn)
 
-            if training_config.num_validation_timesteps is not None:
                 validation_timesteps = torch.linspace(0, sigmas.numel() - 1, training_config.num_validation_timesteps, dtype=torch.long, device=unet.device)
+
+                output_images, conditioning_images = log_validation_train_controlnet(
+                    tokenizer_one=tokenizer_one,
+                    text_encoder_one=text_encoder_one,
+                    tokenizer_two=tokenizer_two,
+                    text_encoder_two=text_encoder_two,
+                    vae=vae,
+                    sigmas=sigmas.to(unet.dtype),
+                    unet=unet,
+                    num_validation_images=training_config.num_validation_images,
+                    validation_prompts=training_config.validation_prompts,
+                    validation_images=training_config.validation_images,
+                    validation_image_conditioning=validation_image_conditioning,
+                    controlnet=controlnet,
+                    timesteps=validation_timesteps,
+                )
+
+                wandb.log({"validation": output_images}, step=training_step)
+
+                if conditioning_images is not None:
+                    wandb.log({"validation_conditioning": conditioning_images}, step=training_step)
+            elif training_config.train_type == "ema_unet_inpainting":
+                validation_timesteps = torch.linspace(0, sigmas.numel() - 1, training_config.num_validation_timesteps, dtype=torch.long, device=unet.device)
+
+                output_images, conditioning_images = log_validation_train_ema_unet_inpainting(
+                    tokenizer_one=tokenizer_one,
+                    text_encoder_one=text_encoder_one,
+                    tokenizer_two=tokenizer_two,
+                    text_encoder_two=text_encoder_two,
+                    vae=vae,
+                    sigmas=sigmas.to(unet.module.dtype),
+                    unet=unet,
+                    ema_unet=ema_unet,
+                    num_validation_images=training_config.num_validation_images,
+                    validation_prompts=training_config.validation_prompts,
+                    validation_images=training_config.validation_images,
+                    timesteps=validation_timesteps,
+                )
+
+                wandb.log({"validation": output_images}, step=training_step)
+
+                if conditioning_images is not None:
+                    wandb.log({"validation_conditioning": conditioning_images}, step=training_step)
             else:
-                validation_timesteps = None
-
-            output_images, conditioning_images = log_validation_train_controlnet(
-                tokenizer_one=tokenizer_one,
-                text_encoder_one=text_encoder_one,
-                tokenizer_two=tokenizer_two,
-                text_encoder_two=text_encoder_two,
-                vae=vae,
-                sigmas=sigmas.to(unet.module.dtype if isinstance(unet, DDP) else unet.dtype),
-                unet=unet,
-                num_validation_images=training_config.num_validation_images,
-                validation_prompts=training_config.validation_prompts,
-                validation_images=training_config.validation_images,
-                validation_image_conditioning=validation_image_conditioning,
-                controlnet=controlnet,
-                timesteps=validation_timesteps,
-            )
-
-            wandb.log({"validation": output_images}, step=training_step)
-
-            if conditioning_images is not None:
-                wandb.log({"validation_conditioning": conditioning_images}, step=training_step)
+                assert False
 
         if dist.get_rank() == 0:
             loss = accumulated_loss.item()
@@ -220,6 +279,8 @@ def main(training_config):
     if dist.get_rank() == 0:
         if training_config.controlnet is not None:
             save_models_train_controlnet(training_config.output_dir, optimizer=optimizer, controlnet=controlnet)
+        elif training_config.train_type == "ema_unet_inpainting":
+            save_models_train_ema_unet_inpainting(training_config.output_dir, optimizer=optimizer, unet=unet, ema_unet=ema_unet)
         else:
             assert False
 
@@ -297,6 +358,81 @@ def init_train_controlnet(training_config, make_dataloader=True):
     return rv
 
 
+def init_train_ema_unet_inpainting(training_config, make_dataloader=True):
+    tokenizer_one = make_clip_tokenizer_one_from_hub()
+    tokenizer_two = make_clip_tokenizer_two_from_hub()
+
+    text_encoder_one = SDXLCLIPOne.load_fp16(device=device)
+    text_encoder_one.requires_grad_(False)
+    text_encoder_one.eval()
+
+    text_encoder_two = SDXLCLIPTwo.load_fp16(device=device)
+    text_encoder_two.requires_grad_(False)
+    text_encoder_two.eval()
+
+    vae = SDXLVae.load_fp16_fix(device=device)
+    vae.to(torch.float16)
+    vae.requires_grad_(False)
+    vae.eval()
+
+    sigmas = make_sigmas(device=device)
+
+    if training_config.unet_resume_from is None:
+        unet = SDXLUNetInpainting.load_fp32(device)
+    else:
+        unet = SDXLUNetInpainting.load(training_config.unet_resume_from, device=device)
+
+    unet.train()
+    unet.requires_grad_(True)
+    unet = DDP(unet, device_ids=[device])
+
+    parameters = [x for x in unet.module.parameters()]
+
+    if training_config.ema_unet_resume_from is None:
+        ema_unet = EMAModel(parameters)
+    else:
+        ema_unet_state_dict = torch.load(training_config.ema_unet_resume_from)
+        ema_unet = EMAModel([])
+        ema_unet.load_state_dict(ema_unet_state_dict)
+
+    if training_config.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`.")
+
+        optimizer = bnb.optim.AdamW8bit(parameters, lr=training_config.learning_rate)
+    else:
+        optimizer = AdamW(parameters, lr=training_config.learning_rate)
+
+    if training_config.optimizer_resume_from is not None:
+        optimizer.load_state_dict(torch.load(training_config.optimizer_resume_from, map_location=torch.device(device)))
+
+    lr_scheduler = LambdaLR(optimizer, lambda _: 1)
+
+    rv = dict(
+        tokenizer_one=tokenizer_one,
+        tokenizer_two=tokenizer_two,
+        text_encoder_one=text_encoder_one,
+        text_encoder_two=text_encoder_two,
+        vae=vae,
+        sigmas=sigmas,
+        unet=unet,
+        ema_unet=ema_unet,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        parameters=parameters,
+    )
+
+    if make_dataloader:
+        from data import wds_dataloader_unet_inpainting_hq_dataset
+
+        dataloader = wds_dataloader_unet_inpainting_hq_dataset(training_config, tokenizer_one, tokenizer_two)
+        rv["dataloader"] = dataloader
+
+    return rv
+
+
 def train_step_train_controlnet(text_encoder_one, text_encoder_two, vae, sigmas, unet, batch, controlnet, training_config: TrainingConfig):
     with torch.no_grad():
         micro_conditioning = batch["micro_conditioning"].to(device=unet.device)
@@ -351,6 +487,57 @@ def train_step_train_controlnet(text_encoder_one, text_encoder_two, vae, sigmas,
             pooled_encoder_hidden_states=pooled_encoder_hidden_states,
             down_block_additional_residuals=down_block_additional_residuals,
             mid_block_additional_residual=mid_block_additional_residual,
+        )
+
+        loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+
+    return loss
+
+
+def train_step_train_ema_unet_inpainting(text_encoder_one, text_encoder_two, vae, sigmas, unet, batch, training_config: TrainingConfig):
+    with torch.no_grad():
+        micro_conditioning = batch["micro_conditioning"].to(device=unet.module.device)
+
+        image = batch["image"].to(vae.device, dtype=vae.dtype)
+        latents = vae.encode(image).to(dtype=unet.module.dtype)
+
+        text_input_ids_one = batch["text_input_ids_one"].to(text_encoder_one.device)
+        text_input_ids_two = batch["text_input_ids_two"].to(text_encoder_two.device)
+
+        encoder_hidden_states, pooled_encoder_hidden_states = sdxl_text_conditioning(text_encoder_one, text_encoder_two, text_input_ids_one, text_input_ids_two)
+
+        encoder_hidden_states = encoder_hidden_states.to(dtype=unet.module.dtype)
+        pooled_encoder_hidden_states = pooled_encoder_hidden_states.to(dtype=unet.module.dtype)
+
+        bsz = latents.shape[0]
+
+        timesteps = torch.randint(0, sigmas.numel(), (bsz,), device=unet.module.device)
+
+        sigmas_ = sigmas[timesteps].to(dtype=latents.dtype)[:, None, None, None]
+
+        noise = torch.randn_like(latents)
+
+        noisy_latents = latents + noise * sigmas_
+
+        scaled_noisy_latents = noisy_latents / ((sigmas_**2 + 1) ** 0.5)
+
+        conditioning_image = vae.encode(batch["conditioning_image"].to(device=vae.device, dtype=vae.dtype)).to(dtype=unet.module.dtype)
+
+        conditioning_image_mask = F.interpolate(batch["conditioning_image_mask"], size=scaled_noisy_latents.shape[2:]).to(device=unet.module.device, dtype=unet.module.dtype)
+
+        model_input = torch.concat([scaled_noisy_latents, conditioning_image_mask, conditioning_image], dim=1)
+
+    with torch.autocast(
+        "cuda",
+        training_config.mixed_precision,
+        enabled=training_config.mixed_precision is not None,
+    ):
+        model_pred = unet(
+            x_t=model_input,
+            t=timesteps,
+            encoder_hidden_states=encoder_hidden_states,
+            micro_conditioning=micro_conditioning,
+            pooled_encoder_hidden_states=pooled_encoder_hidden_states,
         )
 
         loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
@@ -430,6 +617,108 @@ def log_validation_train_controlnet(
     return output_images, conditioning_images
 
 
+@torch.no_grad()
+def log_validation_train_ema_unet_inpainting(
+    tokenizer_one: Tokenizer,
+    text_encoder_one,
+    tokenizer_two: Tokenizer,
+    text_encoder_two,
+    vae,
+    sigmas,
+    unet,
+    ema_unet,
+    validation_images,
+    validation_prompts,
+    num_validation_images,
+    timesteps=None,
+):
+    unet_ = unet.module
+    unet_.eval()
+
+    ema_unet.store(unet_.parameters())
+    ema_unet.copy_to(unet_.parameters())
+
+    conditioning_images = None
+    formatted_validation_images = None
+
+    if validation_images is not None:
+        formatted_validation_images = []
+        conditioning_images = []
+
+        for validation_image_path in validation_images:
+            validation_image_path: str = validation_image_path
+            if validation_image_path.startswith(("https://", "http://")):
+                import requests
+
+                validation_image = Image.open(requests.get(validation_image_path, stream=True).raw)
+            else:
+                validation_image = Image.open(validation_image_path)
+
+            validation_image = validation_image.convert("RGB")
+            validation_image = validation_image.resize((1024, 1024))
+
+            from data import get_unet_inpainting_conditioning_image
+
+            conditioning_image = get_unet_inpainting_conditioning_image(validation_image)
+
+            conditioning_image_ = vae.encode(conditioning_image["conditioning_image"][None, :, :, :].to(device=vae.device, dtype=vae.dtype)).to(device=unet_.device, dtype=unet_.dtype)
+            conditioning_image_mask = F.interpolate(conditioning_image["conditioning_image_mask"][None, :, :, :], size=conditioning_image_.shape[2:]).to(
+                device=unet.module.device, dtype=unet.module.dtype
+            )
+            conditioning_image_ = torch.concat([conditioning_image_mask, conditioning_image_], dim=1)
+
+            formatted_validation_images.append(conditioning_image_)
+
+            conditioning_images.append(wandb.Image(conditioning_image["conditioning_image_as_pil"]))
+
+    generator = torch.Generator(unet_.device).manual_seed(0)
+
+    output_images = []
+
+    for formatted_validation_image, validation_prompt in zip(formatted_validation_images, validation_prompts):
+        for _ in range(num_validation_images):
+            from diffusion import (euler_ode_solver,
+                                   sdxl_eps_theta_unet_inpainting)
+
+            encoder_hidden_states, pooled_encoder_hidden_states = sdxl_text_conditioning(
+                text_encoder_one,
+                text_encoder_two,
+                torch.tensor(tokenizer_one.encode(validation_prompt).ids, dtype=torch.long, device=text_encoder_one.device),
+                torch.tensor(tokenizer_two.encode(validation_prompt).ids, dtype=torch.long, device=text_encoder_two.device),
+            )
+            encoder_hidden_states = encoder_hidden_states.to(unet_.dtype)
+            pooled_encoder_hidden_states = pooled_encoder_hidden_states.to(unet_.dtype)
+
+            micro_conditioning = torch.tensor([[1024, 1024, 0, 0, 1024, 1024]], dtype=torch.long, device=unet_.device)
+
+            x_T = torch.randn((1, 4, 1024 // 8, 1024 // 8), dtype=unet_.dtype, device=unet_.device, generator=generator)
+            x_T = x_T * ((sigmas[timesteps[-1]] ** 2 + 1) ** 0.5)
+
+            eps_theta = lambda *args, **kwargs: sdxl_eps_theta_unet_inpainting(
+                *args,
+                **kwargs,
+                unet=unet_,
+                encoder_hidden_states=encoder_hidden_states,
+                pooled_encoder_hidden_states=pooled_encoder_hidden_states,
+                negative_encoder_hidden_states=torch.zeros_like(encoder_hidden_states),
+                negative_pooled_encoder_hidden_states=torch.zeros_like(pooled_encoder_hidden_states),
+                micro_conditioning=micro_conditioning,
+                inpainting_conditioning=formatted_validation_image.to(dtype=unet_.dtype, device=unet_.device),
+            )
+
+            x_0 = euler_ode_solver(eps_theta=eps_theta, timesteps=timesteps, sigmas=sigmas, x_T=x_T)
+
+            x_0 = vae.decode(x_0.to(vae.dtype))
+            x_0 = vae.output_tensor_to_pil(x_0)[0]
+
+            output_images.append(wandb.Image(x_0, caption=validation_prompt))
+
+    ema_unet.restore(unet_.parameters())
+    unet_.train()
+
+    return output_images, conditioning_images
+
+
 def make_save_checkpoint(output_dir, checkpoints_total_limit, training_step):
     # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
     if checkpoints_total_limit is not None:
@@ -467,6 +756,23 @@ def save_models_train_controlnet(save_path: str, optimizer, controlnet):
         safetensors.torch.save_file(controlnet.module.state_dict(), os.path.join(save_path, "controlnet.safetensors"))
     else:
         torch.save(controlnet.module.state_dict(), os.path.join(save_path, "controlnet.bin"))
+
+    logger.info(f"Saved to {save_path}")
+
+
+def save_models_train_ema_unet_inpainting(save_path: str, optimizer, unet, ema_unet):
+    try:
+        torch.save(optimizer.state_dict(), os.path.join(save_path, "optimizer.bin"))
+    except RuntimeError as err:
+        # TODO - RuntimeError: [enforce fail at inline_container.cc:337] . unexpected pos 2075490688 vs 2075490580
+        logger.warning(f"failed to save optimizer {err}")
+
+    torch.save(ema_unet.state_dict(), os.path.join(save_path, "ema_unet.bin"))
+
+    if has_safetensors:
+        safetensors.torch.save_file(unet.module.state_dict(), os.path.join(save_path, "unet.safetensors"))
+    else:
+        torch.save(unet.module.state_dict(), os.path.join(save_path, "unet.bin"))
 
     logger.info(f"Saved to {save_path}")
 

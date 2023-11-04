@@ -299,3 +299,144 @@ def sdxl_eps_theta(
         eps_hat = eps_hat_uncond + guidance_scale * (eps_hat - eps_hat_uncond)
 
     return eps_hat
+
+
+@torch.no_grad()
+def sdxl_eps_theta_(
+    x_t,
+    t,
+    sigma,
+    unet,
+    encoder_hidden_states,
+    pooled_encoder_hidden_states,
+    negative_encoder_hidden_states,
+    negative_pooled_encoder_hidden_states,
+    micro_conditioning,
+    guidance_scale,
+):
+    # TODO - how does this not effect the ode we are solving
+    scaled_x_t = x_t / ((sigma**2 + 1) ** 0.5)
+
+    if guidance_scale > 1.0:
+        scaled_x_t = torch.concat([scaled_x_t, scaled_x_t])
+
+        encoder_hidden_states = torch.concat((encoder_hidden_states, negative_encoder_hidden_states))
+        pooled_encoder_hidden_states = torch.concat((pooled_encoder_hidden_states, negative_pooled_encoder_hidden_states))
+
+        micro_conditioning = torch.concat([micro_conditioning, micro_conditioning])
+
+    eps_hat = unet(
+        x_t=scaled_x_t,
+        t=t,
+        encoder_hidden_states=encoder_hidden_states,
+        micro_conditioning=micro_conditioning,
+        pooled_encoder_hidden_states=pooled_encoder_hidden_states,
+    )
+
+    if guidance_scale > 1.0:
+        eps_hat, eps_hat_uncond = eps_hat.chunk(2)
+
+        eps_hat = eps_hat_uncond + guidance_scale * (eps_hat - eps_hat_uncond)
+
+    return eps_hat
+
+
+@torch.no_grad()
+def sdxl_eps_theta_controlnet(
+    x_t,
+    t,
+    sigma,
+    unet,
+    encoder_hidden_states,
+    pooled_encoder_hidden_states,
+    negative_encoder_hidden_states,
+    negative_pooled_encoder_hidden_states,
+    micro_conditioning,
+    guidance_scale,
+    controlnet,
+    controlnet_cond,
+):
+    # TODO - how does this not effect the ode we are solving
+    scaled_x_t = x_t / ((sigma**2 + 1) ** 0.5)
+
+    if guidance_scale > 1.0:
+        scaled_x_t = torch.concat([scaled_x_t, scaled_x_t])
+
+        encoder_hidden_states = torch.concat((encoder_hidden_states, negative_encoder_hidden_states))
+        pooled_encoder_hidden_states = torch.concat((pooled_encoder_hidden_states, negative_pooled_encoder_hidden_states))
+
+        micro_conditioning = torch.concat([micro_conditioning, micro_conditioning])
+
+        controlnet_cond = torch.concat([controlnet_cond, controlnet_cond])
+
+    controlnet_out = controlnet(
+        x_t=scaled_x_t.to(controlnet.dtype),
+        t=t,
+        encoder_hidden_states=encoder_hidden_states.to(controlnet.dtype),
+        micro_conditioning=micro_conditioning.to(controlnet.dtype),
+        pooled_encoder_hidden_states=pooled_encoder_hidden_states.to(controlnet.dtype),
+        controlnet_cond=controlnet_cond,
+    )
+
+    down_block_additional_residuals = [x.to(unet.dtype) for x in controlnet_out["down_block_res_samples"]]
+    mid_block_additional_residual = controlnet_out["mid_block_res_sample"].to(unet.dtype)
+
+    eps_hat = unet(
+        x_t=scaled_x_t,
+        t=t,
+        encoder_hidden_states=encoder_hidden_states,
+        micro_conditioning=micro_conditioning,
+        pooled_encoder_hidden_states=pooled_encoder_hidden_states,
+        down_block_additional_residuals=down_block_additional_residuals,
+        mid_block_additional_residual=mid_block_additional_residual,
+    )
+
+    if guidance_scale > 1.0:
+        eps_hat, eps_hat_uncond = eps_hat.chunk(2)
+
+        eps_hat = eps_hat_uncond + guidance_scale * (eps_hat - eps_hat_uncond)
+
+    return eps_hat
+
+
+@torch.no_grad()
+def sdxl_eps_theta_unet_inpainting(
+    x_t,
+    t,
+    sigma,
+    unet,
+    encoder_hidden_states,
+    pooled_encoder_hidden_states,
+    negative_encoder_hidden_states,
+    negative_pooled_encoder_hidden_states,
+    micro_conditioning,
+    inpainting_conditioning,
+    guidance_scale=5.0,
+):
+    # TODO - how does this not effect the ode we are solving
+    scaled_x_t = x_t / ((sigma**2 + 1) ** 0.5)
+
+    if guidance_scale > 1.0:
+        scaled_x_t = torch.concat([scaled_x_t, scaled_x_t])
+
+        encoder_hidden_states = torch.concat((encoder_hidden_states, negative_encoder_hidden_states))
+        pooled_encoder_hidden_states = torch.concat((pooled_encoder_hidden_states, negative_pooled_encoder_hidden_states))
+
+        micro_conditioning = torch.concat([micro_conditioning, micro_conditioning])
+
+        inpainting_conditioning = torch.concat([inpainting_conditioning, inpainting_conditioning])
+
+    eps_hat = unet(
+        x_t=torch.concat([scaled_x_t, inpainting_conditioning], dim=1),
+        t=t,
+        encoder_hidden_states=encoder_hidden_states,
+        micro_conditioning=micro_conditioning,
+        pooled_encoder_hidden_states=pooled_encoder_hidden_states,
+    )
+
+    if guidance_scale > 1.0:
+        eps_hat, eps_hat_uncond = eps_hat.chunk(2)
+
+        eps_hat = eps_hat_uncond + guidance_scale * (eps_hat - eps_hat_uncond)
+
+    return eps_hat
