@@ -646,8 +646,8 @@ if __name__ == "__main__":
         tests.test_controlnet()
         tests.test_adapter()
 
-    # test_save_checkpoint()
-    # test_save_checkpoint_checkpoints_total_limit()
+    test_save_checkpoint()
+    test_save_checkpoint_checkpoints_total_limit()
 
     # tests = TrainControlnetInpaintingTests(0).test()
     # tests.test_log_validation_controlnet_inpainting()
