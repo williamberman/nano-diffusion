@@ -363,6 +363,7 @@ def get_unet_inpainting_conditioning_image(image):
     conditioning_image_as_pil = Image.fromarray(conditioning_image_as_pil)
 
     conditioning_image = conditioning_image * (conditioning_image_mask < 0.5)
+    conditioning_image = (conditioning_image - 0.5) / 0.5
 
     return dict(
         conditioning_image=conditioning_image,
