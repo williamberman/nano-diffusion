@@ -19,7 +19,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 import wandb
-from diffusion import make_sigmas, sdxl_diffusion_loop
+from diffusion import make_sigmas, sdxl_diffusion_loop, set_with_tqdm
 from ema_model import EMAModel
 from models import (SDXLCLIPOne, SDXLCLIPTwo, SDXLControlNet, SDXLUNet,
                     SDXLUNetInpainting, SDXLVae,
@@ -64,6 +64,7 @@ class TrainingConfig:
     mixed_precision: Optional[torch.dtype] = None
     max_train_steps: int = 30_000
     use_8bit_adam: bool = False
+    ema_rate: Optional[float] = None
 
     # data
     shuffle_buffer_size: int = 1000
@@ -78,6 +79,7 @@ class TrainingConfig:
     num_validation_timesteps: int = 50
     validation_prompts: Optional[List[str]] = None
     validation_images: Optional[List[str]] = None
+    with_tqdm: bool = False
 
     # checkpointing
     checkpointing_steps: int = 1000
@@ -105,6 +107,8 @@ def main(training_config: TrainingConfig):
                 project=training_config.project_name,
                 config=training_config,
             )
+
+    set_with_tqdm(training_config.with_tqdm)
 
     if training_config.controlnet is not None:
         x = init_train_controlnet(training_config)
@@ -389,7 +393,10 @@ def init_train_ema_unet_inpainting(training_config, make_dataloader=True):
     parameters = [x for x in unet.module.parameters()]
 
     if training_config.ema_unet_resume_from is None:
-        ema_unet = EMAModel(parameters)
+        kwargs = {}
+        if training_config.ema_decay is not None:
+            kwargs['decay'] = training_config.ema_decay
+        ema_unet = EMAModel(parameters, **kwargs)
     else:
         ema_unet_state_dict = torch.load(training_config.ema_unet_resume_from)
         ema_unet = EMAModel([])
