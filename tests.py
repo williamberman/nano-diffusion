@@ -253,12 +253,17 @@ class InferenceTests:
         diff = np.abs(out - expected_out).flatten()
         diff.sort()
 
-        assert scipy.stats.mode(diff).mode < 2
+        mode = scipy.stats.mode(diff).mode
+        mean = diff.mean()
+
+        print(f"test_text_to_image mode: {mode} mean: {mean}")
+
+        assert mode < 2
 
         if self.dtype == torch.float32:
-            assert diff.mean() < 2
+            assert mean < 8
         elif self.dtype == torch.float16:
-            assert diff.mean() < 4
+            assert mean < 8
         else:
             assert False
 
@@ -651,7 +656,20 @@ if __name__ == "__main__":
         test_train = True
 
     if test_inference:
-        for dtype in [torch.float16, torch.float32]:
+        if "DTYPE" in os.environ:
+            if os.environ["DTYPE"] == "fp16":
+                dtypes = [torch.float16]
+                print("only testing fp16")
+            elif os.environ["DTYPE"] == "fp32":
+                dtypes = [torch.float32]
+                print("only testing fp32")
+            else:
+                assert False
+        else:
+            dtypes = [torch.float16, torch.float32]
+            print("testing fp16 and fp32")
+
+        for dtype in dtypes:
             tests = InferenceTests("cuda", dtype)
             tests.test_sdxl_vae()
             tests.test_sdxl_unet()

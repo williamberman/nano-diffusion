@@ -9,7 +9,6 @@ from typing import Dict, List, Literal, Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import wandb
 import yaml
 from PIL import Image
 from torch.cuda.amp.grad_scaler import GradScaler
@@ -18,6 +17,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
+import wandb
 from diffusion import make_sigmas, sdxl_diffusion_loop
 from models import (SDXLAdapter, SDXLCLIPOne, SDXLCLIPTwo, SDXLControlNet,
                     SDXLUNet, SDXLVae, make_clip_tokenizer_one_from_hub,
@@ -133,10 +133,10 @@ def main(training_config):
                     text_encoder_two=text_encoder_two,
                     vae=vae,
                     unet=unet,
-                    mixed_precision=training_config.mixed_precision,
                     batch=batch,
                     controlnet=controlnet,
                     sigmas=sigmas,
+                    training_config=training_config,
                 )
 
             loss = loss / training_config.gradient_accumulation_steps
@@ -169,7 +169,7 @@ def main(training_config):
                 )
 
                 if training_config.controlnet is not None:
-                    save_models_train_controlnet(save_path, optimizer, unet, controlnet)
+                    save_models_train_controlnet(save_path, optimizer=optimizer, controlnet=controlnet)
                 else:
                     assert False
 
@@ -218,7 +218,10 @@ def main(training_config):
     dist.barrier()
 
     if dist.get_rank() == 0:
-        save_models(unet, training_config.output_dir, optimizer=optimizer, controlnet=controlnet, adapter=adapter)
+        if training_config.controlnet is not None:
+            save_models_train_controlnet(training_config.output_dir, optimizer=optimizer, controlnet=controlnet)
+        else:
+            assert False
 
 
 def init_train_controlnet(training_config, make_dataloader=True):
@@ -281,7 +284,6 @@ def init_train_controlnet(training_config, make_dataloader=True):
         controlnet=controlnet,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
-        dataloader=dataloader,
         parameters=parameters,
     )
 
@@ -454,7 +456,7 @@ def make_save_checkpoint(output_dir, checkpoints_total_limit, training_step):
     return save_path
 
 
-def save_models_train_controlnet(save_path: str, optimizer, unet, controlnet):
+def save_models_train_controlnet(save_path: str, optimizer, controlnet):
     try:
         torch.save(optimizer.state_dict(), os.path.join(save_path, "optimizer.bin"))
     except RuntimeError as err:
@@ -462,12 +464,8 @@ def save_models_train_controlnet(save_path: str, optimizer, unet, controlnet):
         logger.warning(f"failed to save optimizer {err}")
 
     if has_safetensors:
-        safetensors.torch.save_file(unet.state_dict(), os.path.join(save_path, "unet.safetensors"))
-
         safetensors.torch.save_file(controlnet.module.state_dict(), os.path.join(save_path, "controlnet.safetensors"))
     else:
-        torch.save(unet.state_dict(), os.path.join(save_path, "unet.bin"))
-
         torch.save(controlnet.module.state_dict(), os.path.join(save_path, "controlnet.bin"))
 
     logger.info(f"Saved to {save_path}")
