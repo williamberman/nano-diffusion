@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, default_collate
 from models import SDXLVae
 
 
-def wds_dataloader(training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
+def wds_dataloader_controlnet_inpainting_sdxl_synthetic_dataset(training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
     import webdataset as wds
 
     if isinstance(training_config.train_shards, list):
@@ -31,7 +31,7 @@ def wds_dataloader(training_config, tokenizer_one: Tokenizer, tokenizer_two: Tok
     dataset = (
         wds.WebDataset(train_shards, resampled=True, handler=wds.warn_and_continue)
         .shuffle(training_config.shuffle_buffer_size)
-        .map(lambda d: make_sample(d, training_config, tokenizer_one, tokenizer_two))
+        .map(lambda d: make_sample_controlnet_inpainting_sdxl_synthetic_dataset(d, training_config, tokenizer_one, tokenizer_two))
         .select(lambda sample: sample is not None)
         .batched(training_config.batch_size, partial=False, collation_fn=default_collate)
     )
@@ -50,20 +50,14 @@ def wds_dataloader(training_config, tokenizer_one: Tokenizer, tokenizer_two: Tok
 
 
 @torch.no_grad()
-def make_sample(sample, training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
-    if training_config.sdxl_synthetic_dataset:
-        image = sdxl_synthetic_dataset_get_use_largest_clip_score(sample)
+def make_sample_controlnet_inpainting_sdxl_synthetic_dataset(sample, training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
+    image = sdxl_synthetic_dataset_get_use_largest_clip_score(sample)
 
-        if image is None:
-            return None
+    if image is None:
+        return None
 
-        original_height = 1024
-        original_width = 1024
-    else:
-        image = sample["png"]
-        metadata = json.loads(sample["json"].decode("utf-8"))
-        original_width = int(metadata.get("original_width", 0.0))
-        original_height = int(metadata.get("original_height", 0.0))
+    original_height = 1024
+    original_width = 1024
 
     with io.BytesIO(image) as stream:
         image = PIL.Image.open(stream)
@@ -96,27 +90,183 @@ def make_sample(sample, training_config, tokenizer_one: Tokenizer, tokenizer_two
         1024,
     )
 
-    sample = {
-        "micro_conditioning": micro_conditioning,
-        "text_input_ids_one": text_input_ids_one,
-        "text_input_ids_two": text_input_ids_two,
-        "image": SDXLVae.input_pil_to_tensor(image, include_batch_dim=False),
-    }
+    conditioning_image = get_controlnet_inpainting_conditioning_image(image)
+    conditioning_image = conditioning_image["conditioning_image"]
 
-    if training_config.adapter == "openpose":
-        conditioning = get_adapter_openpose_conditioning_image(image)
+    return dict(
+        micro_conditioning=micro_conditioning,
+        text_input_ids_one=text_input_ids_one,
+        text_input_ids_two=text_input_ids_two,
+        image=SDXLVae.input_pil_to_tensor(image, include_batch_dim=False),
+        conditioning_image=conditioning_image,
+    )
 
-        if conditioning is None:
-            return None
 
-        sample["conditioning_image"] = conditioning["conditioning_image"]
-    elif training_config.controlnet == "canny":
-        sample["conditioning_image"] = get_controlnet_canny_conditioning_image(image)["conditioning_image"]
-    elif training_config.controlnet == "inpainting":
-        conditioning_image = get_controlnet_inpainting_conditioning_image(image)
-        sample["conditioning_image"] = conditioning_image["conditioning_image"]
+def wds_dataloader_controlnet_inpainting(training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
+    import webdataset as wds
 
-    return sample
+    if isinstance(training_config.train_shards, list):
+        train_shards = []
+        for x in training_config.train_shards:
+            train_shards.extend(braceexpand(x))
+    elif isinstance(training_config.train_shards, str):
+        train_shards = braceexpand(training_config.train_shards)
+    else:
+        assert False
+
+    dataset = (
+        wds.WebDataset(train_shards, resampled=True, handler=wds.warn_and_continue)
+        .shuffle(training_config.shuffle_buffer_size)
+        .map(lambda d: make_sample_controlnet_inpainting(d, training_config, tokenizer_one, tokenizer_two))
+        .select(lambda sample: sample is not None)
+        .batched(training_config.batch_size, partial=False, collation_fn=default_collate)
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=None,
+        shuffle=False,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=8,
+    )
+
+    return dataloader
+
+
+@torch.no_grad()
+def make_sample_controlnet_inpainting(sample, training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
+    image = sample["png"]
+    metadata = json.loads(sample["json"].decode("utf-8"))
+    original_width = int(metadata.get("original_width", 0.0))
+    original_height = int(metadata.get("original_height", 0.0))
+
+    with io.BytesIO(image) as stream:
+        image = PIL.Image.open(stream)
+        image.load()
+        image = image.convert("RGB")
+
+    if random.random() < training_config.proportion_empty_prompts:
+        text = ""
+    else:
+        text = sample["txt"].decode("utf-8")
+
+    c_top, c_left, _, _ = get_random_crop_params([image.height, image.width], [1024, 1024])
+
+    micro_conditioning = torch.tensor([original_width, original_height, c_top, c_left, 1024, 1024])
+
+    text_input_ids_one = torch.tensor(tokenizer_one.encode(text).ids, dtype=torch.long)
+    text_input_ids_two = torch.tensor(tokenizer_two.encode(text).ids, dtype=torch.long)
+
+    image = TF.resize(
+        image,
+        1024,
+        interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+    )
+
+    image = TF.crop(
+        image,
+        c_top,
+        c_left,
+        1024,
+        1024,
+    )
+
+    conditioning_image = get_controlnet_inpainting_conditioning_image(image)
+    conditioning_image = conditioning_image["conditioning_image"]
+
+    return dict(
+        micro_conditioning=micro_conditioning,
+        text_input_ids_one=text_input_ids_one,
+        text_input_ids_two=text_input_ids_two,
+        image=SDXLVae.input_pil_to_tensor(image, include_batch_dim=False),
+        conditioning_image=conditioning_image,
+    )
+
+
+def wds_dataloader_unet_inpainting_hq_dataset(training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer, return_dataloader=True):
+    import webdataset as wds
+
+    if isinstance(training_config.train_shards, list):
+        train_shards = []
+        for x in training_config.train_shards:
+            train_shards.extend(braceexpand(x))
+    elif isinstance(training_config.train_shards, str):
+        train_shards = braceexpand(training_config.train_shards)
+    else:
+        assert False
+
+    dataset = (
+        wds.WebDataset(train_shards, resampled=True, handler=wds.warn_and_continue)
+        .shuffle(training_config.shuffle_buffer_size)
+        .map(lambda d: make_sample_unet_inpainting_hq_dataset(d, training_config, tokenizer_one, tokenizer_two))
+        .select(lambda sample: sample is not None)
+        .batched(training_config.batch_size, partial=False, collation_fn=default_collate)
+    )
+
+    if return_dataloader:
+        return DataLoader(
+            dataset,
+            batch_size=None,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=8,
+        )
+    else:
+        return dataset
+
+
+@torch.no_grad()
+def make_sample_unet_inpainting_hq_dataset(sample, training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
+    image = sample["png"]
+
+    with io.BytesIO(image) as stream:
+        image = PIL.Image.open(stream)
+        image.load()
+        image = image.convert("RGB")
+
+    if random.random() < training_config.proportion_empty_prompts:
+        text = ""
+    else:
+        text = sample["txt"].decode("utf-8")
+
+    text_input_ids_one = torch.tensor(tokenizer_one.encode(text).ids, dtype=torch.long)
+    text_input_ids_two = torch.tensor(tokenizer_two.encode(text).ids, dtype=torch.long)
+
+    original_height = image.height
+    original_width = image.width
+
+    image = TF.resize(
+        image,
+        1024,
+        interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+    )
+
+    c_top, c_left, _, _ = get_random_crop_params([image.height, image.width], [1024, 1024])
+
+    micro_conditioning = torch.tensor([original_height, original_width, c_top, c_left, 1024, 1024])
+
+    image = TF.crop(
+        image,
+        c_top,
+        c_left,
+        1024,
+        1024,
+    )
+
+    conditioning_image = get_unet_inpainting_conditioning_image(image)
+
+    return dict(
+        micro_conditioning=micro_conditioning,
+        text_input_ids_one=text_input_ids_one,
+        text_input_ids_two=text_input_ids_two,
+        image=SDXLVae.input_pil_to_tensor(image, include_batch_dim=False),
+        conditioning_image=conditioning_image["conditioning_image"],
+        conditioning_image_mask=conditioning_image["conditioning_image_mask"],
+    )
 
 
 def sdxl_synthetic_dataset_get_use_largest_clip_score(sample):
@@ -160,31 +310,6 @@ def get_random_crop_params(input_size: Tuple[int, int], output_size: Tuple[int, 
     return i, j, th, tw
 
 
-_open_pose = None
-
-
-def get_adapter_openpose_conditioning_image(image):
-    global _open_pose
-
-    if _open_pose is None:
-        from controlnet_aux import OpenposeDetector
-
-        _open_pose = OpenposeDetector.from_pretrained("lllyasviel/Annotators")
-
-    resolution = image.width
-
-    conditioning_image = _open_pose(image, detect_resolution=resolution, image_resolution=resolution, return_pil=False)
-
-    if (conditioning_image == 0).all():
-        return None
-
-    conditioning_image_as_pil = Image.fromarray(conditioning_image)
-
-    conditioning_image = conditioning_image.permute(2, 0, 1).to(torch.float32) / 255.0
-
-    return dict(conditioning_image=conditioning_image, conditioning_image_as_pil=conditioning_image_as_pil)
-
-
 def get_controlnet_canny_conditioning_image(image):
     import cv2
 
@@ -216,6 +341,28 @@ def get_controlnet_inpainting_conditioning_image(image):
     # -1 is outside of the 0-1 range that the controlnet normalized
     # input is in.
     conditioning_image = conditioning_image * (conditioning_image_mask < 0.5) + -1.0 * (conditioning_image_mask >= 0.5)
+
+    return dict(
+        conditioning_image=conditioning_image,
+        conditioning_image_as_pil=conditioning_image_as_pil,
+        conditioning_image_mask=conditioning_image_mask,
+        unmasked_conditioning_image=unmasked_conditioning_image,
+    )
+
+
+def get_unet_inpainting_conditioning_image(image):
+    conditioning_image_mask = make_random_mask(image.height, image.width)
+
+    conditioning_image = torch.from_numpy(np.array(image))
+    conditioning_image = conditioning_image.permute(2, 0, 1).to(torch.float32) / 255.0
+    unmasked_conditioning_image = conditioning_image
+
+    # Just zero out the pixels which will be masked
+    conditioning_image_as_pil = conditioning_image * (conditioning_image_mask < 0.5)
+    conditioning_image_as_pil = (conditioning_image_as_pil.clamp(0, 1) * 255).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+    conditioning_image_as_pil = Image.fromarray(conditioning_image_as_pil)
+
+    conditioning_image = conditioning_image * (conditioning_image_mask < 0.5)
 
     return dict(
         conditioning_image=conditioning_image,
