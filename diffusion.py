@@ -132,12 +132,12 @@ def rk4_ode_solver(eps_theta, timesteps, sigmas, x_T):
 
 @torch.no_grad()
 def sdxl_diffusion_loop(
-    prompts: Union[str, List[str]],
-    unet,
-    tokenizer_one,
-    text_encoder_one,
-    tokenizer_two,
-    text_encoder_two,
+    prompts: Union[str, List[str]] = None,
+    unet=None,
+    tokenizer_one=None,
+    text_encoder_one=None,
+    tokenizer_two=None,
+    text_encoder_two=None,
     images=None,
     controlnet=None,
     adapter=None,
@@ -149,23 +149,33 @@ def sdxl_diffusion_loop(
     generator=None,
     negative_prompts=None,
     sampler=euler_ode_solver,
+    encoder_hidden_states=None,
+    pooled_encoder_hidden_states=None,
 ):
     if isinstance(prompts, str):
         prompts = [prompts]
 
-    batch_size = len(prompts)
+    if prompts is not None:
+        batch_size = len(prompts)
+    else:
+        batch_size = encoder_hidden_states.shape[0]
 
     if negative_prompts is not None and guidance_scale > 1.0:
         prompts += negative_prompts
 
-    encoder_hidden_states, pooled_encoder_hidden_states = sdxl_text_conditioning(
-        text_encoder_one,
-        text_encoder_two,
-        torch.tensor([x.ids for x in tokenizer_one.encode_batch(prompts)], dtype=torch.long, device=text_encoder_one.device),
-        torch.tensor([x.ids for x in tokenizer_two.encode_batch(prompts)], dtype=torch.long, device=text_encoder_one.device),
-    )
-    encoder_hidden_states = encoder_hidden_states.to(unet.dtype)
-    pooled_encoder_hidden_states = pooled_encoder_hidden_states.to(unet.dtype)
+    if encoder_hidden_states is None:
+        assert pooled_encoder_hidden_states is None
+
+        encoder_hidden_states, pooled_encoder_hidden_states = sdxl_text_conditioning(
+            text_encoder_one,
+            text_encoder_two,
+            torch.tensor([x.ids for x in tokenizer_one.encode_batch(prompts)], dtype=torch.long, device=text_encoder_one.device),
+            torch.tensor([x.ids for x in tokenizer_two.encode_batch(prompts)], dtype=torch.long, device=text_encoder_one.device),
+        )
+        encoder_hidden_states = encoder_hidden_states.to(unet.dtype)
+        pooled_encoder_hidden_states = pooled_encoder_hidden_states.to(unet.dtype)
+    else:
+        assert pooled_encoder_hidden_states is not None
 
     if guidance_scale > 1.0:
         if negative_prompts is None:
