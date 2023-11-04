@@ -6,6 +6,8 @@
 
 set -e
 
+export HF_HOME=/fsx/william/hf_home
+
 # force crashing on nccl issues like hanging broadcast
 export NCCL_ASYNC_ERROR_HANDLING=1
 
