@@ -634,25 +634,43 @@ def namedtuple_helper(**kwargs):
 
 
 if __name__ == "__main__":
-    torch.cuda.set_device(train.device)
-    dist.init_process_group("nccl")
+    if "TEST" in os.environ:
+        if os.environ["TEST"] == "inference":
+            print("only testing inference")
+            test_inference = True
+            test_train = False
+        elif os.environ["TEST"] == "train":
+            print("only testing training")
+            test_inference = False
+            test_train = True
+        else:
+            assert False
+    else:
+        print("testing inference and training")
+        test_inference = True
+        test_train = True
 
-    for dtype in [torch.float16, torch.float32]:
-        tests = InferenceTests("cuda", dtype)
-        tests.test_sdxl_vae()
-        tests.test_sdxl_unet()
-        tests.test_text_to_image()
-        tests.test_heun()
-        tests.test_rk4()
-        tests.test_controlnet()
-        tests.test_adapter()
+    if test_inference:
+        for dtype in [torch.float16, torch.float32]:
+            tests = InferenceTests("cuda", dtype)
+            tests.test_sdxl_vae()
+            tests.test_sdxl_unet()
+            tests.test_text_to_image()
+            tests.test_heun()
+            tests.test_rk4()
+            tests.test_controlnet()
+            tests.test_adapter()
 
-    test_save_checkpoint()
-    test_save_checkpoint_checkpoints_total_limit()
+    if test_train:
+        torch.cuda.set_device(train.device)
+        dist.init_process_group("nccl")
 
-    tests = TrainControlnetInpaintingTests(0)
-    tests.test_log_validation()
+        test_save_checkpoint()
+        test_save_checkpoint_checkpoints_total_limit()
 
-    test_controlnet_inpainting_main()
+        tests = TrainControlnetInpaintingTests(0)
+        tests.test_log_validation()
+
+        test_controlnet_inpainting_main()
 
     print("All tests passed!")
