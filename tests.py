@@ -502,8 +502,8 @@ class TrainControlnetInpaintingTests:
         self.controlnet = x["controlnet"]
         self.optimizer = x["optimizer"]
 
-    def test_log_validation_controlnet_inpainting(self):
-        print("test_log_validation_controlnet_inpainting")
+    def test_log_validation(self):
+        print("test_log_validation")
 
         timesteps = torch.tensor([0], dtype=torch.long, device=self.sigmas.device)
 
@@ -606,6 +606,7 @@ def test_controlnet_inpainting_main():
             project_name="nano_diffusion_testing",
             training_run_name="test_controlnet_inpainting",
             train_shards=["pipe:aws s3 cp s3://muse-datasets/sdxl-synthetic-dataset/0/{00000..00011}.tar -"],
+            use_8bit_adam=True,
         )
 
         train.main(training_config)
@@ -629,7 +630,7 @@ def test_controlnet_inpainting_main():
 
 
 def namedtuple_helper(**kwargs):
-    return namedtuple("", kwargs.keys())(**kwargs)
+    return namedtuple("anon", kwargs.keys())(**kwargs)
 
 
 if __name__ == "__main__":
@@ -649,9 +650,9 @@ if __name__ == "__main__":
     test_save_checkpoint()
     test_save_checkpoint_checkpoints_total_limit()
 
-    # tests = TrainControlnetInpaintingTests(0).test()
-    # tests.test_log_validation_controlnet_inpainting()
+    tests = TrainControlnetInpaintingTests(0)
+    tests.test_log_validation()
 
-    # test_controlnet_inpainting_main()
+    test_controlnet_inpainting_main()
 
     print("All tests passed!")
