@@ -312,7 +312,7 @@ def sdxl_eps_theta_(
     negative_encoder_hidden_states,
     negative_pooled_encoder_hidden_states,
     micro_conditioning,
-    guidance_scale,
+    guidance_scale=5.0,
 ):
     # TODO - how does this not effect the ode we are solving
     scaled_x_t = x_t / ((sigma**2 + 1) ** 0.5)
@@ -352,9 +352,9 @@ def sdxl_eps_theta_controlnet(
     negative_encoder_hidden_states,
     negative_pooled_encoder_hidden_states,
     micro_conditioning,
-    guidance_scale,
     controlnet,
     controlnet_cond,
+    guidance_scale=5.0,
 ):
     # TODO - how does this not effect the ode we are solving
     scaled_x_t = x_t / ((sigma**2 + 1) ** 0.5)
