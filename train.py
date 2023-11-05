@@ -19,12 +19,14 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 import wandb
-from diffusion import (euler_ode_solver, make_sigmas, sdxl_diffusion_loop,
-                       sdxl_eps_theta_, sdxl_eps_theta_unet_inpainting,
-                       set_with_tqdm)
+from diffusion import (
+    euler_ode_solver, make_sigmas, sdxl_diffusion_loop, sdxl_eps_theta_,
+    sdxl_eps_theta_unet_inpainting,
+    sdxl_eps_theta_unet_inpainting_cross_attention_conditioning, set_with_tqdm)
 from ema_model import EMAModel
 from models import (SDXLCLIPOne, SDXLCLIPTwo, SDXLControlNet, SDXLUNet,
-                    SDXLUNetInpainting, SDXLVae,
+                    SDXLUNetInpainting,
+                    SDXLUNetInpaintingCrossAttentionConditioning, SDXLVae,
                     make_clip_tokenizer_one_from_hub,
                     make_clip_tokenizer_two_from_hub, sdxl_text_conditioning)
 
@@ -58,7 +60,7 @@ class TrainingConfig:
     # additional networks
     adapter: Optional[Literal["openpose"]] = None
     controlnet: Optional[Literal["canny", "inpainting"]] = None
-    train_type: Optional[Literal["ema_unet_inpainting", "unet_inpainting", "unet_text_to_image"]] = None
+    train_type: Optional[Literal["ema_unet_inpainting", "unet_inpainting", "unet_text_to_image", "unet_inpainting_cross_attention_conditioning"]] = None
 
     # training
     learning_rate: float = 0.00001
@@ -166,6 +168,19 @@ def main(training_config: TrainingConfig):
         lr_scheduler = x["lr_scheduler"]
         dataloader = x["dataloader"]
         parameters = x["parameters"]
+    elif training_config.train_type == "unet_inpainting_cross_attention_conditioning":
+        x = init_train_unet_inpainting_cross_attention_conditioning(training_config)
+        tokenizer_one = x["tokenizer_one"]
+        tokenizer_two = x["tokenizer_two"]
+        text_encoder_one = x["text_encoder_one"]
+        text_encoder_two = x["text_encoder_two"]
+        vae = x["vae"]
+        sigmas = x["sigmas"]
+        unet = x["unet"]
+        optimizer = x["optimizer"]
+        lr_scheduler = x["lr_scheduler"]
+        dataloader = x["dataloader"]
+        parameters = x["parameters"]
     else:
         assert False
 
@@ -220,6 +235,16 @@ def main(training_config: TrainingConfig):
                     sigmas=sigmas,
                     training_config=training_config,
                 )
+            elif training_config.train_type == "unet_inpainting_cross_attention_conditioning":
+                loss = train_step_train_unet_inpainting_cross_attention_conditioning(
+                    text_encoder_one=text_encoder_one,
+                    text_encoder_two=text_encoder_two,
+                    vae=vae,
+                    unet=unet,
+                    batch=batch,
+                    sigmas=sigmas,
+                    training_config=training_config,
+                )
             else:
                 assert False
 
@@ -263,6 +288,8 @@ def main(training_config: TrainingConfig):
                     save_models_train_unet_inpainting(save_path, optimizer=optimizer, unet=unet)
                 elif training_config.train_type == "unet_text_to_image":
                     save_models_train_unet_text_to_image(save_path, optimizer=optimizer, unet=unet)
+                elif training_config.train_type == "unet_inpainting_cross_attention_conditioning":
+                    save_models_train_unet_inpainting_cross_attention_conditioning(save_path, optimizer=optimizer, unet=unet)
                 else:
                     assert False
 
@@ -339,6 +366,21 @@ def main(training_config: TrainingConfig):
                     timesteps=validation_timesteps,
                     training_step=training_step,
                 )
+            elif training_config.train_type == "unet_inpainting_cross_attention_conditioning":
+                log_validation_train_unet_inpainting_cross_attention_conditioning(
+                    tokenizer_one=tokenizer_one,
+                    text_encoder_one=text_encoder_one,
+                    tokenizer_two=tokenizer_two,
+                    text_encoder_two=text_encoder_two,
+                    vae=vae,
+                    sigmas=sigmas.to(unet.module.dtype),
+                    unet=unet,
+                    num_validation_images=training_config.num_validation_images,
+                    validation_prompts=training_config.validation_prompts,
+                    validation_images=training_config.validation_images,
+                    timesteps=validation_timesteps,
+                    training_step=training_step,
+                )
             else:
                 assert False
 
@@ -360,6 +402,8 @@ def main(training_config: TrainingConfig):
             save_models_train_unet_inpainting(training_config.output_dir, optimizer=optimizer, unet=unet)
         elif training_config.train_type == "unet_text_to_image":
             save_models_train_unet_text_to_image(training_config.output_dir, optimizer=optimizer, unet=unet)
+        elif training_config.train_type == "unet_inpainting_cross_attention_conditioning":
+            save_models_train_unet_inpainting_cross_attention_conditioning(training_config.output_dir, optimizer=optimizer, unet=unet)
         else:
             assert False
 
@@ -597,7 +641,7 @@ def log_validation_train_controlnet(
         wandb.log({"validation": output_images}, step=training_step)
         wandb.log({"validation_conditioning": conditioning_images}, step=training_step)
 
-    return output_images, conditioning_image
+    return output_images, conditioning_images
 
 
 def save_models_train_controlnet(save_path: str, optimizer, controlnet):
@@ -651,7 +695,7 @@ def init_train_ema_unet_inpainting(training_config, make_dataloader=True):
             kwargs["decay"] = training_config.ema_decay
         ema_unet = EMAModel(parameters, **kwargs)
     else:
-        ema_unet_state_dict = torch.load(training_config.ema_unet_resume_from)
+        ema_unet_state_dict = torch.load(training_config.ema_unet_resume_from, map_location=torch.device(device))
         ema_unet = EMAModel([])
         ema_unet.load_state_dict(ema_unet_state_dict)
 
@@ -840,7 +884,7 @@ def log_validation_train_ema_unet_inpainting(
         wandb.log({"validation": output_images}, step=training_step)
         wandb.log({"validation_conditioning": conditioning_images}, step=training_step)
 
-    return output_images, conditioning_image
+    return output_images, conditioning_images
 
 
 def save_models_train_ema_unet_inpainting(save_path: str, optimizer, unet, ema_unet):
@@ -1069,7 +1113,7 @@ def log_validation_train_unet_inpainting(
         wandb.log({"validation": output_images}, step=training_step)
         wandb.log({"validation_conditioning": conditioning_images}, step=training_step)
 
-    return output_images, conditioning_image
+    return output_images, conditioning_images
 
 
 def save_models_train_unet_inpainting(save_path: str, optimizer, unet):
@@ -1264,6 +1308,236 @@ def log_validation_train_unet_text_to_image(
 
 
 def save_models_train_unet_text_to_image(save_path: str, optimizer, unet):
+    try:
+        torch.save(optimizer.state_dict(), os.path.join(save_path, "optimizer.bin"))
+    except RuntimeError as err:
+        # TODO - RuntimeError: [enforce fail at inline_container.cc:337] . unexpected pos 2075490688 vs 2075490580
+        logger.warning(f"failed to save optimizer {err}")
+
+    if has_safetensors:
+        safetensors.torch.save_file(unet.module.state_dict(), os.path.join(save_path, "unet.safetensors"))
+    else:
+        torch.save(unet.module.state_dict(), os.path.join(save_path, "unet.bin"))
+
+    logger.info(f"Saved to {save_path}")
+
+
+def init_train_unet_inpainting_cross_attention_conditioning(training_config, make_dataloader=True):
+    tokenizer_one = make_clip_tokenizer_one_from_hub()
+    tokenizer_two = make_clip_tokenizer_two_from_hub()
+
+    text_encoder_one = SDXLCLIPOne.load_fp16(device=device)
+    text_encoder_one.requires_grad_(False)
+    text_encoder_one.eval()
+
+    text_encoder_two = SDXLCLIPTwo.load_fp16(device=device)
+    text_encoder_two.requires_grad_(False)
+    text_encoder_two.eval()
+
+    vae = SDXLVae.load_fp16_fix(device=device)
+    vae.to(torch.float16)
+    vae.requires_grad_(False)
+    vae.eval()
+
+    sigmas = make_sigmas(device=device)
+
+    if training_config.unet_resume_from is None:
+        unet = SDXLUNetInpaintingCrossAttentionConditioning.load_fp32(device)
+    else:
+        unet = SDXLUNetInpaintingCrossAttentionConditioning.load(training_config.unet_resume_from, device=device)
+
+    unet.train()
+    unet.requires_grad_(True)
+    unet = DDP(unet, device_ids=[device])
+
+    parameters = [x for x in unet.module.parameters()]
+
+    if training_config.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`.")
+
+        optimizer = bnb.optim.AdamW8bit(parameters, lr=training_config.learning_rate)
+    else:
+        optimizer = AdamW(parameters, lr=training_config.learning_rate)
+
+    if training_config.optimizer_resume_from is not None:
+        optimizer.load_state_dict(torch.load(training_config.optimizer_resume_from, map_location=torch.device(device)))
+
+    lr_scheduler = LambdaLR(optimizer, lambda _: 1)
+
+    rv = dict(
+        tokenizer_one=tokenizer_one,
+        tokenizer_two=tokenizer_two,
+        text_encoder_one=text_encoder_one,
+        text_encoder_two=text_encoder_two,
+        vae=vae,
+        sigmas=sigmas,
+        unet=unet,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        parameters=parameters,
+    )
+
+    if make_dataloader:
+        from data import wds_dataloader_unet_inpainting_hq_dataset
+
+        dataloader = wds_dataloader_unet_inpainting_hq_dataset(training_config, tokenizer_one, tokenizer_two)
+        rv["dataloader"] = dataloader
+
+    return rv
+
+
+def train_step_train_unet_inpainting_cross_attention_conditioning(text_encoder_one, text_encoder_two, vae, sigmas, unet, batch, training_config: TrainingConfig):
+    with torch.no_grad():
+        micro_conditioning = batch["micro_conditioning"].to(device=unet.module.device)
+
+        image = batch["image"].to(vae.device, dtype=vae.dtype)
+        latents = vae.encode(image).to(dtype=unet.module.dtype)
+
+        text_input_ids_one = batch["text_input_ids_one"].to(text_encoder_one.device)
+        text_input_ids_two = batch["text_input_ids_two"].to(text_encoder_two.device)
+
+        encoder_hidden_states, pooled_encoder_hidden_states = sdxl_text_conditioning(text_encoder_one, text_encoder_two, text_input_ids_one, text_input_ids_two)
+
+        encoder_hidden_states = encoder_hidden_states.to(dtype=unet.module.dtype)
+        pooled_encoder_hidden_states = pooled_encoder_hidden_states.to(dtype=unet.module.dtype)
+
+        bsz = latents.shape[0]
+
+        timesteps = torch.randint(0, sigmas.numel(), (bsz,), device=unet.module.device)
+
+        sigmas_ = sigmas[timesteps].to(dtype=latents.dtype)[:, None, None, None]
+
+        noise = torch.randn_like(latents)
+
+        noisy_latents = latents + noise * sigmas_
+
+        scaled_noisy_latents = noisy_latents / ((sigmas_**2 + 1) ** 0.5)
+
+        conditioning_image = vae.encode(batch["conditioning_image"].to(device=vae.device, dtype=vae.dtype)).to(dtype=unet.module.dtype)
+
+        conditioning_image_mask = F.interpolate(batch["conditioning_image_mask"], size=scaled_noisy_latents.shape[2:]).to(device=unet.module.device, dtype=unet.module.dtype)
+
+    with torch.autocast(
+        "cuda",
+        training_config.mixed_precision,
+        enabled=training_config.mixed_precision is not None,
+    ):
+        model_pred = unet(
+            x_t=scaled_noisy_latents,
+            t=timesteps,
+            encoder_hidden_states=encoder_hidden_states,
+            micro_conditioning=micro_conditioning,
+            pooled_encoder_hidden_states=pooled_encoder_hidden_states,
+            conditioning_image=conditioning_image,
+            conditioning_image_mask=conditioning_image_mask,
+        )
+
+        loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+
+    return loss
+
+
+@torch.no_grad()
+def log_validation_train_unet_inpainting_cross_attention_conditioning(
+    tokenizer_one: Tokenizer,
+    text_encoder_one,
+    tokenizer_two: Tokenizer,
+    text_encoder_two,
+    vae,
+    sigmas,
+    unet,
+    validation_images,
+    validation_prompts,
+    num_validation_images,
+    training_step,
+    timesteps=None,
+    do_log=True,
+):
+    unet_ = unet.module
+    unet_.eval()
+
+    formatted_validation_images = []
+    conditioning_images = []
+
+    for validation_image_path in validation_images:
+        validation_image_path: str = validation_image_path
+        if validation_image_path.startswith(("https://", "http://")):
+            import requests
+
+            validation_image = Image.open(requests.get(validation_image_path, stream=True).raw)
+        else:
+            validation_image = Image.open(validation_image_path)
+
+        validation_image = validation_image.convert("RGB")
+        validation_image = validation_image.resize((1024, 1024))
+
+        from data import get_unet_inpainting_conditioning_image
+
+        conditioning_image = get_unet_inpainting_conditioning_image(validation_image)
+
+        conditioning_image_ = vae.encode(conditioning_image["conditioning_image"][None, :, :, :].to(device=vae.device, dtype=vae.dtype)).to(device=unet_.device, dtype=unet_.dtype)
+
+        conditioning_image_mask = F.interpolate(conditioning_image["conditioning_image_mask"][None, :, :, :], size=conditioning_image_.shape[2:]).to(device=unet.module.device, dtype=unet.module.dtype)
+
+        formatted_validation_images.append((conditioning_image_, conditioning_image_mask))
+
+        conditioning_images.append(wandb.Image(conditioning_image["conditioning_image_as_pil"]))
+
+    generator = torch.Generator(unet_.device).manual_seed(0)
+
+    output_images = []
+
+    for formatted_validation_image, validation_prompt in zip(formatted_validation_images, validation_prompts):
+        for _ in range(num_validation_images):
+            encoder_hidden_states, pooled_encoder_hidden_states = sdxl_text_conditioning(
+                text_encoder_one,
+                text_encoder_two,
+                torch.tensor(tokenizer_one.encode(validation_prompt).ids, dtype=torch.long, device=text_encoder_one.device),
+                torch.tensor(tokenizer_two.encode(validation_prompt).ids, dtype=torch.long, device=text_encoder_two.device),
+            )
+            encoder_hidden_states = encoder_hidden_states.to(unet_.dtype)
+            pooled_encoder_hidden_states = pooled_encoder_hidden_states.to(unet_.dtype)
+
+            micro_conditioning = torch.tensor([[1024, 1024, 0, 0, 1024, 1024]], dtype=torch.long, device=unet_.device)
+
+            x_T = torch.randn((1, 4, 1024 // 8, 1024 // 8), dtype=unet_.dtype, device=unet_.device, generator=generator)
+            x_T = x_T * ((sigmas[timesteps[-1]] ** 2 + 1) ** 0.5)
+
+            conditioning_image, conditioning_image_mask = formatted_validation_image
+
+            eps_theta = lambda *args, **kwargs: sdxl_eps_theta_unet_inpainting_cross_attention_conditioning(
+                *args,
+                **kwargs,
+                unet=unet_,
+                encoder_hidden_states=encoder_hidden_states,
+                pooled_encoder_hidden_states=pooled_encoder_hidden_states,
+                negative_encoder_hidden_states=torch.zeros_like(encoder_hidden_states),
+                negative_pooled_encoder_hidden_states=torch.zeros_like(pooled_encoder_hidden_states),
+                micro_conditioning=micro_conditioning,
+                conditioning_image=conditioning_image.to(dtype=unet_.dtype, device=unet_.device),
+                conditioning_image_mask=conditioning_image_mask.to(dtype=unet_.dtype, device=unet_.device),
+            )
+
+            x_0 = euler_ode_solver(eps_theta=eps_theta, timesteps=timesteps, sigmas=sigmas, x_T=x_T)
+
+            x_0 = vae.decode(x_0.to(vae.dtype))
+            x_0 = vae.output_tensor_to_pil(x_0)[0]
+
+            output_images.append(wandb.Image(x_0, caption=validation_prompt))
+
+    unet_.train()
+
+    if do_log:
+        wandb.log({"validation": output_images}, step=training_step)
+        wandb.log({"validation_conditioning": conditioning_images}, step=training_step)
+
+    return output_images, conditioning_images
+
+
+def save_models_train_unet_inpainting_cross_attention_conditioning(save_path: str, optimizer, unet):
     try:
         torch.save(optimizer.state_dict(), os.path.join(save_path, "optimizer.bin"))
     except RuntimeError as err:
