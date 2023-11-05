@@ -102,6 +102,30 @@ def make_sample_controlnet_inpainting_sdxl_synthetic_dataset(sample, training_co
     )
 
 
+def sdxl_synthetic_dataset_get_use_largest_clip_score(sample):
+    if "clip_scores.txt" not in sample:
+        return None
+
+    clip_scores = sample["clip_scores.txt"].decode("utf-8")
+    clip_scores = clip_scores.split(",")
+    clip_scores = [float(x) for x in clip_scores]
+
+    index_of_max = 0
+
+    for i in range(1, len(clip_scores)):
+        if clip_scores[i] > clip_scores[index_of_max]:
+            index_of_max = i
+
+    key_of_best_clip_score_image = f"{index_of_max}.png"
+
+    if key_of_best_clip_score_image not in sample:
+        raise ValueError(
+            f"{key_of_best_clip_score_image} was not found in sample. The dataset should have files <sample key>.<x>.png where <x> coresponds to an index of the clip scores in clip_scores.txt"
+        )
+
+    return sample[key_of_best_clip_score_image]
+
+
 def wds_dataloader_controlnet_inpainting(training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
     import webdataset as wds
 
@@ -269,28 +293,84 @@ def make_sample_unet_inpainting_hq_dataset(sample, training_config, tokenizer_on
     )
 
 
-def sdxl_synthetic_dataset_get_use_largest_clip_score(sample):
-    if "clip_scores.txt" not in sample:
-        return None
+def wds_dataloader_unet_text_to_image_hq_dataset(training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer, return_dataloader=True):
+    import webdataset as wds
 
-    clip_scores = sample["clip_scores.txt"].decode("utf-8")
-    clip_scores = clip_scores.split(",")
-    clip_scores = [float(x) for x in clip_scores]
+    if isinstance(training_config.train_shards, list):
+        train_shards = []
+        for x in training_config.train_shards:
+            train_shards.extend(braceexpand(x))
+    elif isinstance(training_config.train_shards, str):
+        train_shards = braceexpand(training_config.train_shards)
+    else:
+        assert False
 
-    index_of_max = 0
+    dataset = (
+        wds.WebDataset(train_shards, resampled=True, handler=wds.warn_and_continue)
+        .shuffle(training_config.shuffle_buffer_size)
+        .map(lambda d: make_sample_unet_text_to_image_hq_dataset(d, training_config, tokenizer_one, tokenizer_two))
+        .select(lambda sample: sample is not None)
+        .batched(training_config.batch_size, partial=False, collation_fn=default_collate)
+    )
 
-    for i in range(1, len(clip_scores)):
-        if clip_scores[i] > clip_scores[index_of_max]:
-            index_of_max = i
-
-    key_of_best_clip_score_image = f"{index_of_max}.png"
-
-    if key_of_best_clip_score_image not in sample:
-        raise ValueError(
-            f"{key_of_best_clip_score_image} was not found in sample. The dataset should have files <sample key>.<x>.png where <x> coresponds to an index of the clip scores in clip_scores.txt"
+    if return_dataloader:
+        return DataLoader(
+            dataset,
+            batch_size=None,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=8,
         )
+    else:
+        return dataset
 
-    return sample[key_of_best_clip_score_image]
+
+@torch.no_grad()
+def make_sample_unet_text_to_image_hq_dataset(sample, training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
+    image = sample["png"]
+
+    with io.BytesIO(image) as stream:
+        image = PIL.Image.open(stream)
+        image.load()
+        image = image.convert("RGB")
+
+    if random.random() < training_config.proportion_empty_prompts:
+        text = ""
+    else:
+        text = sample["txt"].decode("utf-8")
+
+    text_input_ids_one = torch.tensor(tokenizer_one.encode(text).ids, dtype=torch.long)
+    text_input_ids_two = torch.tensor(tokenizer_two.encode(text).ids, dtype=torch.long)
+
+    original_height = image.height
+    original_width = image.width
+
+    image = TF.resize(
+        image,
+        1024,
+        interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+    )
+
+    c_top, c_left, _, _ = get_random_crop_params([image.height, image.width], [1024, 1024])
+
+    micro_conditioning = torch.tensor([original_height, original_width, c_top, c_left, 1024, 1024])
+
+    image = TF.crop(
+        image,
+        c_top,
+        c_left,
+        1024,
+        1024,
+    )
+
+    return dict(
+        micro_conditioning=micro_conditioning,
+        text_input_ids_one=text_input_ids_one,
+        text_input_ids_two=text_input_ids_two,
+        image=SDXLVae.input_pil_to_tensor(image, include_batch_dim=False),
+    )
 
 
 def get_random_crop_params(input_size: Tuple[int, int], output_size: Tuple[int, int]) -> Tuple[int, int, int, int]:

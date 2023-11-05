@@ -14,7 +14,8 @@ from PIL import Image
 
 import train
 from data import (get_controlnet_inpainting_conditioning_image,
-                  wds_dataloader_unet_inpainting_hq_dataset)
+                  wds_dataloader_unet_inpainting_hq_dataset,
+                  wds_dataloader_unet_text_to_image_hq_dataset)
 from diffusion import (heun_ode_solver, make_sigmas, rk4_ode_solver,
                        sdxl_diffusion_loop, sdxl_text_conditioning,
                        set_with_tqdm)
@@ -572,6 +573,7 @@ def test_train_controlnet_inpainting_log_validation():
         get_controlnet_inpainting_conditioning_image,
         controlnet=controlnet,
         timesteps=timesteps,
+        do_log=False,
     )
 
     assert len(output_images) == 4
@@ -694,6 +696,8 @@ def test_train_ema_unet_inpainting_log_validation():
         validation_prompts=["bright room with chair", "couple sitting on bench in front of lake"],
         num_validation_images=2,
         timesteps=timesteps,
+        training_step=1,
+        do_log=False,
     )
 
     assert len(output_images) == 4
@@ -790,6 +794,8 @@ def test_train_unet_inpainting_log_validation():
         validation_prompts=["bright room with chair", "couple sitting on bench in front of lake"],
         num_validation_images=2,
         timesteps=timesteps,
+        training_step=1,
+        do_log=False,
     )
 
     assert len(output_images) == 4
@@ -822,6 +828,114 @@ def test_train_unet_inpainting_main():
             checkpoints_total_limit=5,
             project_name="nano_diffusion_testing",
             training_run_name="test_train_unet_inpainting",
+            train_shards=["pipe:aws s3 cp s3://muse-datasets/mj-general/0001/0/00000.tar -"],
+            use_8bit_adam=True,
+        )
+
+        train.main(training_config)
+
+        assert set(os.listdir(tmpdir)) == {"unet.safetensors", "optimizer.bin", "checkpoint-1"}
+
+        training_config_resume_from = dataclasses.asdict(training_config)
+        training_config_resume_from.update(
+            dict(
+                unet_resume_from=os.path.join(tmpdir, "checkpoint-1", "unet.safetensors"),
+                optimizer_resume_from=os.path.join(tmpdir, "checkpoint-1", "optimizer.bin"),
+                start_step=2,
+                max_train_steps=3,
+            )
+        )
+        training_config_resume_from = train.TrainingConfig(**training_config_resume_from)
+
+        train.main(training_config_resume_from)
+
+        assert set(os.listdir(tmpdir)) == {"unet.safetensors", "optimizer.bin", "checkpoint-1", "checkpoint-2"}
+
+
+def test_wds_dataloader_unet_text_to_image_hq_dataset():
+    tokenizer_one = make_clip_tokenizer_one_from_hub()
+    tokenizer_two = make_clip_tokenizer_two_from_hub()
+    dataset = wds_dataloader_unet_text_to_image_hq_dataset(
+        namedtuple_helper(
+            train_shards=["pipe:aws s3 cp s3://muse-datasets/mj-general/0001/0/00000.tar -"],
+            shuffle_buffer_size=5,
+            batch_size=4,
+            proportion_empty_prompts=0.5,
+        ),
+        tokenizer_one,
+        tokenizer_two,
+        return_dataloader=False,
+    )
+
+    batch = next(iter(dataset))
+
+    assert batch["image"].shape == (4, 3, 1024, 1024)
+
+
+def test_train_unet_text_to_image_log_validation():
+    print("test_train_unet_text_to_image_log_validation")
+
+    x = train.init_train_unet_text_to_image(
+        namedtuple_helper(
+            controlnet_resume_from=None,
+            use_8bit_adam=True,
+            optimizer_resume_from=None,
+            learning_rate=0.00001,
+            unet_resume_from=None,
+        ),
+        make_dataloader=False,
+    )
+
+    tokenizer_one = x["tokenizer_one"]
+    tokenizer_two = x["tokenizer_two"]
+    text_encoder_one = x["text_encoder_one"]
+    text_encoder_two = x["text_encoder_two"]
+    vae = x["vae"]
+    sigmas = x["sigmas"]
+    unet = x["unet"]
+
+    timesteps = torch.tensor([0], dtype=torch.long, device=sigmas.device)
+
+    output_images = train.log_validation_train_unet_text_to_image(
+        tokenizer_one=tokenizer_one,
+        text_encoder_one=text_encoder_one,
+        tokenizer_two=tokenizer_two,
+        text_encoder_two=text_encoder_two,
+        vae=vae,
+        sigmas=sigmas.to(unet.module.dtype),
+        unet=unet,
+        validation_prompts=["bright room with chair", "couple sitting on bench in front of lake"],
+        num_validation_images=2,
+        timesteps=timesteps,
+        training_step=1,
+        do_log=False,
+    )
+
+    assert len(output_images) == 4
+
+
+def test_train_unet_text_to_image_main():
+    print("test_train_unet_text_to_image_main")
+
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMP_DIR", None)) as tmpdir:
+        training_config = train.TrainingConfig(
+            output_dir=tmpdir,
+            train_type="unet_text_to_image",
+            learning_rate=0.00001,
+            gradient_accumulation_steps=1,
+            mixed_precision=torch.float16,
+            max_train_steps=2,
+            shuffle_buffer_size=1000,
+            proportion_empty_prompts=0.1,
+            batch_size=2,
+            validation_steps=1,
+            num_validation_timesteps=2,
+            num_validation_images=1,
+            validation_prompts=["bright room with chair"],
+            checkpointing_steps=1,
+            checkpoints_total_limit=5,
+            project_name="nano_diffusion_testing",
+            training_run_name="test_train_unet_text_to_image",
             train_shards=["pipe:aws s3 cp s3://muse-datasets/mj-general/0001/0/00000.tar -"],
             use_8bit_adam=True,
         )
@@ -907,5 +1021,9 @@ if __name__ == "__main__":
 
         test_train_unet_inpainting_log_validation()
         test_train_unet_inpainting_main()
+
+        test_wds_dataloader_unet_text_to_image_hq_dataset()
+        test_train_unet_text_to_image_log_validation()
+        test_train_unet_text_to_image_main()
 
     print("All tests passed!")
