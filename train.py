@@ -28,7 +28,8 @@ from models import (SDXLCLIPOne, SDXLCLIPTwo, SDXLControlNet, SDXLUNet,
                     SDXLUNetInpainting,
                     SDXLUNetInpaintingCrossAttentionConditioning, SDXLVae,
                     make_clip_tokenizer_one_from_hub,
-                    make_clip_tokenizer_two_from_hub, sdxl_text_conditioning)
+                    make_clip_tokenizer_two_from_hub, sdxl_text_conditioning,
+                    set_attention_checkpoint_kv)
 
 try:
     import safetensors.torch
@@ -61,6 +62,7 @@ class TrainingConfig:
     adapter: Optional[Literal["openpose"]] = None
     controlnet: Optional[Literal["canny", "inpainting"]] = None
     train_type: Optional[Literal["ema_unet_inpainting", "unet_inpainting", "unet_text_to_image", "unet_inpainting_cross_attention_conditioning"]] = None
+    gradient_checkpointing: bool = False
 
     # training
     learning_rate: float = 0.00001
@@ -1348,6 +1350,9 @@ def init_train_unet_inpainting_cross_attention_conditioning(training_config, mak
         unet = SDXLUNetInpaintingCrossAttentionConditioning.load_fp32(device)
     else:
         unet = SDXLUNetInpaintingCrossAttentionConditioning.load(training_config.unet_resume_from, device=device)
+
+    unet.gradient_checkpointing = training_config.gradient_checkpointing
+    set_attention_checkpoint_kv(training_config.gradient_checkpointing)
 
     unet.train()
     unet.requires_grad_(True)

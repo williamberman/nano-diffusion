@@ -9,6 +9,7 @@ from tokenizers import (Regex, Tokenizer, decoders, normalizers,
                         pre_tokenizers, processors)
 from tokenizers.models import BPE
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 try:
     import safetensors.torch
@@ -66,6 +67,14 @@ class ModelUtils:
             model.to(next(iter(state_dict.values())).dtype)
 
         return model
+
+    def checkpoint(self, block):
+        do_checkpointing = self.training and hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing
+
+        if do_checkpointing:
+            return lambda *args: checkpoint(block, *args)
+        else:
+            return block
 
 
 def make_clip_tokenizer(vocab_file, merges_file, pad_token_id):
@@ -1100,7 +1109,15 @@ def set_attention_implementation(impl: Literal["xformers", "torch_2.0_scaled_dot
     _attention_implementation = impl
 
 
-def attention(to_q, to_k, to_v, to_out, head_dim, hidden_states, encoder_hidden_states=None, is_causal=False):
+_attention_checkpoint_kv = False
+
+
+def set_attention_checkpoint_kv(val: bool):
+    global _attention_checkpoint_kv
+    _attention_checkpoint_kv = val
+
+
+def attention(to_q, to_k, to_v, to_out, head_dim, hidden_states, encoder_hidden_states=None, is_causal=False, training=True):
     batch_size, q_seq_len, channels = hidden_states.shape
 
     if encoder_hidden_states is not None:
@@ -1111,8 +1128,13 @@ def attention(to_q, to_k, to_v, to_out, head_dim, hidden_states, encoder_hidden_
     kv_seq_len = kv.shape[1]
 
     query = to_q(hidden_states)
-    key = to_k(kv)
-    value = to_v(kv)
+
+    if training and _attention_checkpoint_kv:
+        key = checkpoint(to_k, kv)
+        value = checkpoint(to_v, kv)
+    else:
+        key = to_k(kv)
+        value = to_v(kv)
 
     if _attention_implementation == "xformers":
         import xformers.ops
@@ -1156,7 +1178,7 @@ class Attention(nn.Module):
         self.to_out = nn.Sequential(nn.Linear(channels, channels), nn.Dropout(0.0))
 
     def forward(self, hidden_states, encoder_hidden_states=None):
-        return attention(self.to_q, self.to_k, self.to_v, self.to_out, 64, hidden_states, encoder_hidden_states)
+        return attention(self.to_q, self.to_k, self.to_v, self.to_out, 64, hidden_states, encoder_hidden_states, training=self.training)
 
 
 class VaeMidBlockAttention(nn.Module):
@@ -1177,7 +1199,7 @@ class VaeMidBlockAttention(nn.Module):
 
         hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        hidden_states = attention(self.to_q, self.to_k, self.to_v, self.to_out, self.head_dim, hidden_states)
+        hidden_states = attention(self.to_q, self.to_k, self.to_v, self.to_out, self.head_dim, hidden_states, training=self.training)
 
         hidden_states = hidden_states.transpose(1, 2).view(batch_size, channels, height, width)
 
@@ -1196,7 +1218,7 @@ class CLIPAttention(nn.Module):
         self.out_proj = nn.Linear(channels, channels)
 
     def forward(self, hidden_states):
-        return attention(self.q_proj, self.k_proj, self.v_proj, self.out_proj, 64, hidden_states, is_causal=True)
+        return attention(self.q_proj, self.k_proj, self.v_proj, self.out_proj, 64, hidden_states, is_causal=True, training=self.training)
 
 
 class GEGLU(nn.Module):
@@ -2342,7 +2364,7 @@ class SDXLUNetInpaintingCrossAttentionConditioning(nn.Module, ModelUtils):
 
         for down_block_idx, down_block in enumerate(self.down_blocks):
             for resnet_idx, resnet in enumerate(down_block["resnets"]):
-                hidden_state = resnet(hidden_state, t)
+                hidden_state = self.checkpoint(resnet)(hidden_state, t)
 
                 if "attentions" in down_block:
                     hidden_state = down_block["attentions"][resnet_idx](hidden_state, cross_attention)
@@ -2362,7 +2384,7 @@ class SDXLUNetInpaintingCrossAttentionConditioning(nn.Module, ModelUtils):
 
         hidden_state = self.mid_block["resnets"][0](hidden_state, t)
         hidden_state = self.mid_block["attentions"][0](hidden_state, cross_attention)
-        hidden_state = self.mid_block["resnets"][1](hidden_state, t)
+        hidden_state = self.checkpoint(self.mid_block["resnets"][1])(hidden_state, t)
 
         if mid_block_additional_residual is not None:
             hidden_state = hidden_state + mid_block_additional_residual
@@ -2376,7 +2398,7 @@ class SDXLUNetInpaintingCrossAttentionConditioning(nn.Module, ModelUtils):
 
                 hidden_state = torch.concat([hidden_state, residual], dim=1)
 
-                hidden_state = resnet(hidden_state, t)
+                hidden_state = self.checkpoint(resnet)(hidden_state, t)
 
                 if "attentions" in up_block:
                     hidden_state = up_block["attentions"][resnet_idx](hidden_state, cross_attention)

@@ -1035,6 +1035,7 @@ def test_train_unet_inpainting_cross_attention_conditioning_main():
             training_run_name="test_train_unet_inpainting_cross_attention_conditioning",
             train_shards=["pipe:aws s3 cp s3://muse-datasets/mj-general/0001/0/00000.tar -"],
             use_8bit_adam=True,
+            gradient_checkpointing=True,
         )
 
         train.main(training_config)
