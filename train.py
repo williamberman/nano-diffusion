@@ -69,6 +69,7 @@ class TrainingConfig:
     max_train_steps: int = 30_000
     use_8bit_adam: bool = False
     ema_decay: Optional[float] = None
+    ema_power: Optional[float] = None
 
     # data
     shuffle_buffer_size: int = 1000
@@ -693,6 +694,8 @@ def init_train_ema_unet_inpainting(training_config, make_dataloader=True):
         kwargs = {}
         if training_config.ema_decay is not None:
             kwargs["decay"] = training_config.ema_decay
+        if training_config.ema_power is not None:
+            kwargs["power"] = training_config.ema_power
         ema_unet = EMAModel(parameters, **kwargs)
     else:
         ema_unet_state_dict = torch.load(training_config.ema_unet_resume_from, map_location=torch.device(device))
@@ -1363,7 +1366,10 @@ def init_train_unet_inpainting_cross_attention_conditioning(training_config, mak
         optimizer = AdamW(parameters, lr=training_config.learning_rate)
 
     if training_config.optimizer_resume_from is not None:
-        optimizer.load_state_dict(torch.load(training_config.optimizer_resume_from, map_location=torch.device(device)))
+        optimizer_sd = torch.load(training_config.optimizer_resume_from, map_location=torch.device(device))
+        optimizer_sd["param_groups"][0]["initial_lr"] = training_config.learning_rate
+        optimizer_sd["param_groups"][0]["lr"] = training_config.learning_rate
+        optimizer.load_state_dict(optimizer_sd)
 
     lr_scheduler = LambdaLR(optimizer, lambda _: 1)
 
