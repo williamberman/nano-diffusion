@@ -440,3 +440,51 @@ def sdxl_eps_theta_unet_inpainting(
         eps_hat = eps_hat_uncond + guidance_scale * (eps_hat - eps_hat_uncond)
 
     return eps_hat
+
+
+@torch.no_grad()
+def sdxl_eps_theta_unet_inpainting_cross_attention_conditioning(
+    x_t,
+    t,
+    sigma,
+    unet,
+    encoder_hidden_states,
+    pooled_encoder_hidden_states,
+    negative_encoder_hidden_states,
+    negative_pooled_encoder_hidden_states,
+    micro_conditioning,
+    conditioning_image,
+    conditioning_image_mask,
+    guidance_scale=5.0,
+):
+    # TODO - how does this not effect the ode we are solving
+    scaled_x_t = x_t / ((sigma**2 + 1) ** 0.5)
+
+    if guidance_scale > 1.0:
+        scaled_x_t = torch.concat([scaled_x_t, scaled_x_t])
+
+        encoder_hidden_states = torch.concat((encoder_hidden_states, negative_encoder_hidden_states))
+        pooled_encoder_hidden_states = torch.concat((pooled_encoder_hidden_states, negative_pooled_encoder_hidden_states))
+
+        micro_conditioning = torch.concat([micro_conditioning, micro_conditioning])
+
+        conditioning_image = torch.concat([conditioning_image, conditioning_image])
+
+        conditioning_image_mask = torch.concat([conditioning_image_mask, conditioning_image_mask])
+
+    eps_hat = unet(
+        x_t=scaled_x_t,
+        t=t,
+        encoder_hidden_states=encoder_hidden_states,
+        micro_conditioning=micro_conditioning,
+        pooled_encoder_hidden_states=pooled_encoder_hidden_states,
+        conditioning_image=conditioning_image,
+        conditioning_image_mask=conditioning_image_mask,
+    )
+
+    if guidance_scale > 1.0:
+        eps_hat, eps_hat_uncond = eps_hat.chunk(2)
+
+        eps_hat = eps_hat_uncond + guidance_scale * (eps_hat - eps_hat_uncond)
+
+    return eps_hat

@@ -51,6 +51,9 @@ def wds_dataloader_controlnet_inpainting_sdxl_synthetic_dataset(training_config,
 
 @torch.no_grad()
 def make_sample_controlnet_inpainting_sdxl_synthetic_dataset(sample, training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
+    if "txt" not in sample:
+        return None
+
     image = sdxl_synthetic_dataset_get_use_largest_clip_score(sample)
 
     if image is None:
@@ -161,6 +164,9 @@ def wds_dataloader_controlnet_inpainting(training_config, tokenizer_one: Tokeniz
 
 @torch.no_grad()
 def make_sample_controlnet_inpainting(sample, training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
+    if "txt" not in sample or "png" not in sample or "json" not in sample:
+        return None
+
     image = sample["png"]
     metadata = json.loads(sample["json"].decode("utf-8"))
     original_width = int(metadata.get("original_width", 0.0))
@@ -245,6 +251,9 @@ def wds_dataloader_unet_inpainting_hq_dataset(training_config, tokenizer_one: To
 
 @torch.no_grad()
 def make_sample_unet_inpainting_hq_dataset(sample, training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
+    if "txt" not in sample or "png" not in sample:
+        return None
+
     image = sample["png"]
 
     with io.BytesIO(image) as stream:
@@ -329,6 +338,9 @@ def wds_dataloader_unet_text_to_image_hq_dataset(training_config, tokenizer_one:
 
 @torch.no_grad()
 def make_sample_unet_text_to_image_hq_dataset(sample, training_config, tokenizer_one: Tokenizer, tokenizer_two: Tokenizer):
+    if "txt" not in sample or "png" not in sample:
+        return None
+
     image = sample["png"]
 
     with io.BytesIO(image) as stream:
